@@ -1,0 +1,70 @@
+[project]
+name = "agent"
+version = "0.0.1"
+description = "Starter template for making a new agent LangGraph."
+authors = [
+    { name = "William Fu-Hinthorn", email = "13333726+hinthornw@users.noreply.github.com" },
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=1.0.0",
+    "python-dotenv>=1.0.1",
+    "langchain-core",
+    "langchain-mistralai",
+    "langchain-mcp-adapters",
+    "httpx",
+    "typing-extensions",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
+
+[build-system]
+requires = ["setuptools>=73.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agent*"]
+
+[tool.setuptools.package-data]
+"agent" = [
+    "utils/skills/*.md",
+    "utils/tool_policies/*.md",
+    "py.typed",
+]
+
+[tool.ruff]
+lint.select = [
+    "E",
+    "F",
+    "I",
+    "D",
+    "D401",
+    "T201",
+    "UP",
+]
+lint.ignore = [
+    "UP006",
+    "UP007",
+    "UP035",
+    "D417",
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "UP"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[dependency-groups]
+dev = [
+    "anyio>=4.7.0",
+    "langgraph-cli[inmem]>=0.4.14",
+    "mypy>=1.13.0",
+    "pytest>=9.0.3",
+    "ruff>=0.8.2",
+]
