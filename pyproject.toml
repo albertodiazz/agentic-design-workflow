@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "langchain-core",
     "langchain-mistralai",
+		"mistralai",
     "langchain-mcp-adapters",
     "httpx",
     "typing-extensions",

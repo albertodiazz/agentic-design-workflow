@@ -1,27 +1,45 @@
-"""Read-only Design Validator Agent for Penpot MCP."""
+"""Read-only visual Design Validator Agent for Penpot MCP.
+
+This validator is deterministic:
+1. It exports the current Penpot selection as PNG via read-only `export_shape`.
+2. It sends that PNG as a base64 data URL to a Mistral vision model.
+3. It returns the same validation_report / passed / score / status contract used by
+   the main graph.
+
+Important architecture rule preserved:
+- The Mistral vision call still goes through `metered_ainvoke(...)`.
+- The official Mistral SDK is wrapped by `MistralVisionRunnable` so token metering
+  and the shared request limiter are still used.
+"""
 
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Literal
+from typing import Any, Dict
 
-from httpx import HTTPStatusError, RequestError
+from httpx import RequestError
 from typing_extensions import NotRequired, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mistralai import ChatMistralAI
 
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
 from agent.utils.llm_control import (
     metered_ainvoke,
-    shared_rate_limiter,
     usage_updates_from_metered_result,
+)
+from agent.utils.mistral_vision_runnable import MistralVisionRunnable
+from agent.utils.penpot_image_export import (
+    assert_valid_png_base64,
+    extract_png_base64_from_export_shape,
+    png_base64_to_data_url,
+    save_debug_png_export,
 )
 
 
@@ -31,13 +49,109 @@ from agent.utils.llm_control import (
 
 AGENT_ROOT_DIR = Path(__file__).resolve().parents[2]
 
-VALIDATOR_SKILL_PATH = AGENT_ROOT_DIR / "utils" / "skills" / "design_validator.md"
 PENPOT_READ_TOOLS_PATH = AGENT_ROOT_DIR / "utils" / "tool_policies" / "penpot_read_tools.md"
 PENPOT_WRITE_TOOLS_PATH = AGENT_ROOT_DIR / "utils" / "tool_policies" / "penpot_write_tools.md"
 
 
 # ---------------------------------------------------------------------
-# Markdown loaders
+# Visual validator prompt
+# ---------------------------------------------------------------------
+
+VISUAL_VALIDATOR_PROMPT = """
+Eres un agente validador visual de diseño UI conectado a Penpot mediante MCP.
+
+Vas a recibir una imagen PNG exportada desde Penpot. Tu tarea es evaluar si la pantalla está lista para handoff frontend.
+
+Debes responder únicamente con JSON válido. No uses Markdown. No agregues explicación fuera del JSON.
+
+Evalúa de forma visual:
+- existencia de una pantalla clara
+- jerarquía visual
+- layout y espaciado
+- legibilidad de textos
+- accesibilidad básica
+- consistencia visual
+- preparación general para desarrollo frontend
+
+Limitaciones:
+- Solo puedes evaluar lo visible en la imagen y el contexto textual recibido.
+- Si no puedes verificar nombres de capas, tokens o componentes desde la imagen, marca esos checks como "unknown" o "warning".
+- No inventes detalles internos que no sean visibles.
+
+Criterio simple para passed:
+- passed=true si score >= 70, la pantalla parece entendible para desarrollo y no hay problemas graves evidentes.
+- passed=false si la información es insuficiente, la pantalla no es clara, hay problemas graves o score < 70.
+
+Valores permitidos para checks.*.status:
+pass, warning, fail, unknown
+
+Valores permitidos para issues[].severity:
+low, medium, high, critical
+
+Valores permitidos para status:
+ready, needs_minor_fixes, needs_major_fixes, not_ready
+
+Reglas de status:
+- ready: score >= 85 y sin problemas graves
+- needs_minor_fixes: score entre 70 y 84
+- needs_major_fixes: score entre 50 y 69
+- not_ready: score menor a 50 o información insuficiente
+
+Devuelve exactamente esta estructura JSON:
+
+{
+  "passed": false,
+  "score": 0,
+  "status": "not_ready",
+  "summary": "",
+  "checks": {
+    "screen_structure": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "layer_naming": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "componentization": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "layout_spacing": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "text_legibility": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "accessibility": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "frontend_handoff": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    }
+  },
+  "issues": [],
+  "required_fixes": [],
+  "suggested_structure": "",
+  "developer_notes": [],
+  "can_be_sent_to_development": false
+}
+""".strip()
+
+
+# ---------------------------------------------------------------------
+# Markdown loaders and tool policy
 # ---------------------------------------------------------------------
 
 def read_markdown_file(path: Path) -> str:
@@ -103,30 +217,6 @@ def load_validator_tool_policy() -> ValidatorToolPolicy:
     )
 
 
-_validator_skill_prompt: str | None = None
-
-
-def get_validator_skill_prompt() -> str:
-    global _validator_skill_prompt
-
-    if _validator_skill_prompt is None:
-        _validator_skill_prompt = read_markdown_file(VALIDATOR_SKILL_PATH)
-
-    return _validator_skill_prompt
-
-
-# ---------------------------------------------------------------------
-# LLM config
-# ---------------------------------------------------------------------
-
-validator_llm = ChatMistralAI(
-    model=os.getenv("MISTRAL_MODEL", "mistral-large-latest"),
-    temperature=0,
-    max_retries=2,
-    rate_limiter=shared_rate_limiter,
-)
-
-
 # ---------------------------------------------------------------------
 # State schemas
 # ---------------------------------------------------------------------
@@ -152,7 +242,7 @@ class ValidatorOutputState(TypedDict, total=False):
     token_gate_waited: bool
 
 
-class ValidatorState(MessagesState, total=False):
+class ValidatorState(TypedDict, total=False):
     changeme: NotRequired[str]
 
     validation_report: NotRequired[dict[str, Any] | str | None]
@@ -165,8 +255,6 @@ class ValidatorState(MessagesState, total=False):
     total_tokens: NotRequired[int]
     token_window_used: NotRequired[int]
     token_gate_waited: NotRequired[bool]
-
-    tool_iterations: NotRequired[int]
 
 
 # ---------------------------------------------------------------------
@@ -242,20 +330,20 @@ async def get_validator_tools() -> list[Any]:
         if is_read_only_tool(tool, _validator_tool_policy)
     ]
 
-    _validator_tools_by_name = {
-        tool.name: tool
-        for tool in _validator_tools
-    }
+    _validator_tools_by_name = {}
+    for tool in _validator_tools:
+        tool_name = getattr(tool, "name", "")
+        normalized_name = normalize_tool_name(tool_name)
+        _validator_tools_by_name[tool_name] = tool
+        _validator_tools_by_name[normalized_name] = tool
 
-    if not _validator_tools:
-        available_tools = [
-            getattr(tool, "name", "unknown")
-            for tool in all_tools
-        ]
+    if "export_shape" not in _validator_tools_by_name:
+        available_tools = [getattr(tool, "name", "unknown") for tool in all_tools]
+        allowed_tools = [getattr(tool, "name", "unknown") for tool in _validator_tools]
 
         raise RuntimeError(
-            "No read-only tools were found for the validator. "
-            f"Available tools: {available_tools}"
+            "The visual validator requires the read-only `export_shape` tool. "
+            f"Available tools: {available_tools}. Allowed tools: {allowed_tools}."
         )
 
     return _validator_tools
@@ -264,17 +352,6 @@ async def get_validator_tools() -> list[Any]:
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-
-def stringify_tool_result(observation: Any) -> str:
-    if isinstance(observation, str):
-        return observation
-
-    return json.dumps(
-        observation,
-        ensure_ascii=False,
-        default=str,
-    )
-
 
 def parse_json_report(content: Any) -> dict[str, Any] | str:
     if isinstance(content, dict):
@@ -295,14 +372,25 @@ def parse_json_report(content: Any) -> dict[str, Any] | str:
         cleaned = cleaned.removesuffix("```").strip()
 
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else content
     except json.JSONDecodeError:
-        return content
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+            return parsed if isinstance(parsed, dict) else content
+        except json.JSONDecodeError:
+            pass
+
+    return content
 
 
-def extract_output_from_report(
-    report: dict[str, Any] | str,
-) -> Dict[str, Any]:
+def extract_output_from_report(report: dict[str, Any] | str) -> Dict[str, Any]:
     if isinstance(report, dict):
         return {
             "validation_report": report,
@@ -330,7 +418,43 @@ def make_error_report(
         "score": 0,
         "status": "not_ready",
         "summary": summary,
-        "checks": {},
+        "checks": {
+            "screen_structure": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "layer_naming": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "componentization": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "layout_spacing": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "text_legibility": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "accessibility": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+            "frontend_handoff": {
+                "status": "unknown",
+                "score": 0,
+                "notes": [],
+            },
+        },
         "issues": [
             {
                 "severity": "critical",
@@ -347,6 +471,58 @@ def make_error_report(
     }
 
 
+def build_visual_prompt(context: str | None) -> str:
+    prompt = VISUAL_VALIDATOR_PROMPT
+
+    if context:
+        prompt += (
+            "\n\nContexto adicional del workflow o solicitud original del usuario:\n"
+            f"{context}"
+        )
+
+    return prompt
+
+
+def make_mistral_error_report(exc: Exception) -> dict[str, Any]:
+    status_code = getattr(exc, "status_code", None)
+
+    if status_code == 429:
+        return make_error_report(
+            summary="Mistral devolvió 429 por rate limit durante validación visual.",
+            category="mistral_rate_limit",
+            message=str(exc),
+            recommendation=(
+                "Reducir MISTRAL_REQUESTS_PER_SECOND, reducir concurrencia, "
+                "ajustar MISTRAL_TOKENS_PER_MINUTE o esperar antes de reintentar."
+            ),
+        )
+
+    if status_code == 400:
+        return make_error_report(
+            summary="Mistral rechazó el formato de la solicitud visual.",
+            category="mistral_bad_request",
+            message=str(exc),
+            recommendation=(
+                "Revisar formato image_url, modelo visual, tamaño de imagen y prompt JSON."
+            ),
+        )
+
+    if isinstance(exc, RequestError):
+        return make_error_report(
+            summary="Error de conexión con Mistral durante validación visual.",
+            category="mistral_network",
+            message=repr(exc),
+            recommendation="Revisar red, timeout o disponibilidad del proveedor.",
+        )
+
+    return make_error_report(
+        summary="Error inesperado durante validación visual con Mistral.",
+        category="mistral_vision",
+        message=repr(exc),
+        recommendation="Revisar logs del validador visual.",
+    )
+
+
 # ---------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------
@@ -359,227 +535,119 @@ async def validator_prepare_input(
 
     if not user_input:
         user_input = (
-            "Valida la pantalla actual de Penpot y genera un reporte de handoff "
-            "frontend en JSON válido."
+            "Valida visualmente la pantalla actual de Penpot y genera un reporte "
+            "de handoff frontend en JSON válido."
         )
 
     return {
-        "messages": [HumanMessage(content=user_input)],
+        "changeme": user_input,
         "validation_report": None,
         "passed": None,
         "score": None,
         "status": None,
-        "tool_iterations": 0,
     }
 
 
-async def validator_llm_call(
+async def validator_visual_call(
     state: ValidatorState,
     runtime: Runtime[Context],
 ) -> Dict[str, Any]:
     """
-    Validator LLM call.
+    Export current Penpot selection as PNG and validate it with Mistral Vision.
 
-    Toda llamada al modelo pasa por metered_ainvoke.
+    All LLM usage goes through `metered_ainvoke(...)` using MistralVisionRunnable.
     """
-
     try:
-        tools = await get_validator_tools()
-        llm_with_tools = validator_llm.bind_tools(tools)
+        await get_validator_tools()
+        export_shape = _validator_tools_by_name["export_shape"]
 
-        messages = state.get("messages", [])
+        shape_id = os.getenv("PENPOT_VALIDATOR_SHAPE_ID", "selection")
 
-        if not messages:
-            report = make_error_report(
-                summary="No hay mensajes para validar.",
-                category="runtime",
-                message="El estado del validador no contiene mensajes.",
-                recommendation="Invocar el validador con un input válido.",
-            )
-
-            return {
-                "messages": [AIMessage(content=json.dumps(report, ensure_ascii=False))],
-                **extract_output_from_report(report),
+        export_result = await export_shape.ainvoke(
+            {
+                "shapeId": shape_id,
+                "format": "png",
+                "mode": "shape",
             }
+        )
 
-        last_message = messages[-1]
+        image_b64 = extract_png_base64_from_export_shape(export_result)
 
-        if isinstance(last_message, AIMessage):
-            report = parse_json_report(last_message.content)
+        if not image_b64:
+            report = make_error_report(
+                summary="No se pudo exportar PNG desde Penpot.",
+                category="penpot_export",
+                message=(
+                    "export_shape no devolvió un bloque image/base64. "
+                    f"shapeId usado: {shape_id!r}."
+                ),
+                recommendation=(
+                    "Selecciona un board, grupo o pantalla en Penpot, o define "
+                    "PENPOT_VALIDATOR_SHAPE_ID con un shapeId exportable."
+                ),
+            )
             return extract_output_from_report(report)
 
-        validator_skill_prompt = get_validator_skill_prompt()
+        assert_valid_png_base64(image_b64)
+        if os.getenv("PENPOT_VALIDATOR_DEBUG_EXPORT", "0") == "1":
+            await asyncio.to_thread(
+                save_debug_png_export,
+                image_b64,
+                output_dir=os.getenv("PENPOT_DEBUG_OUT", "/tmp/penpot_debug"),
+                stem="validator_export",
+            )
 
-        llm_messages = [
-            SystemMessage(content=validator_skill_prompt),
-            *messages,
-        ]
 
-        metered_result = await metered_ainvoke(
-            llm_with_tools,
-            llm_messages,
-            estimated_completion_tokens=1500,
-            extra_estimated_tokens=2000,
+        image_data_url = png_base64_to_data_url(image_b64)
+
+        vision_runnable = MistralVisionRunnable(
+            image_data_url=image_data_url,
+            model=os.getenv("MISTRAL_VISION_MODEL", "mistral-large-2512"),
+            temperature=0,
+            response_format={"type": "json_object"},
         )
 
-        ai_message = metered_result.ai_message
+        visual_prompt = build_visual_prompt(state.get("changeme"))
 
-        updates: Dict[str, Any] = {
-            "messages": [ai_message],
+        try:
+            metered_result = await metered_ainvoke(
+                vision_runnable,
+                [HumanMessage(content=visual_prompt)],
+                estimated_completion_tokens=int(
+                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "1500")
+                ),
+                extra_estimated_tokens=int(
+                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "3000")
+                ),
+            )
+        except Exception as exc:
+            report = make_mistral_error_report(exc)
+            return extract_output_from_report(report)
+
+        report = parse_json_report(metered_result.ai_message.content)
+
+        if not isinstance(report, dict):
+            report = make_error_report(
+                summary="Mistral Vision no devolvió JSON parseable.",
+                category="mistral_json",
+                message=str(report),
+                recommendation="Revisar prompt visual y response_format json_object.",
+            )
+
+        return {
+            **extract_output_from_report(report),
             **usage_updates_from_metered_result(state, metered_result),
-        }
-
-        if not getattr(ai_message, "tool_calls", None):
-            report = parse_json_report(ai_message.content)
-            updates.update(extract_output_from_report(report))
-
-        return updates
-
-    except HTTPStatusError as exc:
-        status_code = exc.response.status_code if exc.response else None
-
-        report = make_error_report(
-            summary=f"Error HTTP al llamar al modelo validador: {status_code}",
-            category="llm_call",
-            message=str(exc),
-            recommendation="Revisar límites, orden de mensajes o configuración del modelo.",
-        )
-
-        return {
-            "messages": [AIMessage(content=json.dumps(report, ensure_ascii=False))],
-            **extract_output_from_report(report),
-        }
-
-    except RequestError as exc:
-        report = make_error_report(
-            summary="Error de conexión al llamar al modelo validador.",
-            category="network",
-            message=str(exc),
-            recommendation="Revisar conexión con el proveedor del modelo.",
-        )
-
-        return {
-            "messages": [AIMessage(content=json.dumps(report, ensure_ascii=False))],
-            **extract_output_from_report(report),
         }
 
     except Exception as exc:
         report = make_error_report(
-            summary="Error inesperado durante la validación.",
-            category="runtime",
+            summary="Error inesperado durante la validación visual.",
+            category="validator_runtime",
             message=repr(exc),
-            recommendation="Revisar logs del validador.",
+            recommendation="Revisar logs del validador visual, MCP y configuración de Mistral.",
         )
 
-        return {
-            "messages": [AIMessage(content=json.dumps(report, ensure_ascii=False))],
-            **extract_output_from_report(report),
-        }
-
-
-async def validator_tool_node(
-    state: ValidatorState,
-    runtime: Runtime[Context],
-) -> Dict[str, Any]:
-    await get_validator_tools()
-
-    last_message = state["messages"][-1]
-    tool_calls = getattr(last_message, "tool_calls", [])
-
-    result = []
-
-    for tool_call in tool_calls:
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        tool_call_id = tool_call["id"]
-
-        tool = _validator_tools_by_name.get(tool_name)
-
-        if tool is None:
-            observation = {
-                "error": "tool_not_allowed_or_not_found",
-                "tool": tool_name,
-                "message": (
-                    "La herramienta solicitada no está permitida para el validador. "
-                    "Este agente solo puede usar herramientas de lectura."
-                ),
-            }
-        else:
-            try:
-                observation = await tool.ainvoke(tool_args)
-            except Exception as exc:
-                observation = {
-                    "error": "tool_execution_error",
-                    "tool": tool_name,
-                    "message": repr(exc),
-                }
-
-        result.append(
-            ToolMessage(
-                content=stringify_tool_result(observation),
-                tool_call_id=tool_call_id,
-            )
-        )
-
-    previous_iterations = state.get("tool_iterations", 0)
-
-    return {
-        "messages": result,
-        "tool_iterations": previous_iterations + 1,
-    }
-
-
-async def validator_force_finish(
-    state: ValidatorState,
-    runtime: Runtime[Context],
-) -> Dict[str, Any]:
-    report = make_error_report(
-        summary="El validador alcanzó el límite máximo de iteraciones de tools.",
-        category="validator_loop",
-        message=(
-            "El modelo siguió solicitando herramientas y no generó un reporte final "
-            "dentro del límite configurado."
-        ),
-        recommendation=(
-            "Reducir el alcance de validación o revisar si las tools de lectura "
-            "devuelven suficiente información."
-        ),
-    )
-
-    return {
-        "messages": [AIMessage(content=json.dumps(report, ensure_ascii=False))],
-        **extract_output_from_report(report),
-    }
-
-
-# ---------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------
-
-MAX_VALIDATOR_TOOL_ITERATIONS = int(
-    os.getenv("MAX_VALIDATOR_TOOL_ITERATIONS", "4")
-)
-
-
-def validator_should_continue(
-    state: ValidatorState,
-) -> Literal["validator_tool_node", "validator_force_finish", "__end__"]:
-    messages = state.get("messages", [])
-
-    if not messages:
-        return END
-
-    last_message = messages[-1]
-
-    if getattr(last_message, "tool_calls", None):
-        tool_iterations = state.get("tool_iterations", 0)
-
-        if tool_iterations >= MAX_VALIDATOR_TOOL_ITERATIONS:
-            return "validator_force_finish"
-
-        return "validator_tool_node"
-
-    return END
+        return extract_output_from_report(report)
 
 
 # ---------------------------------------------------------------------
@@ -594,20 +662,10 @@ validator_builder = StateGraph(
 )
 
 validator_builder.add_node("validator_prepare_input", validator_prepare_input)
-validator_builder.add_node("validator_llm_call", validator_llm_call)
-validator_builder.add_node("validator_tool_node", validator_tool_node)
-validator_builder.add_node("validator_force_finish", validator_force_finish)
+validator_builder.add_node("validator_visual_call", validator_visual_call)
 
 validator_builder.add_edge(START, "validator_prepare_input")
-validator_builder.add_edge("validator_prepare_input", "validator_llm_call")
+validator_builder.add_edge("validator_prepare_input", "validator_visual_call")
+validator_builder.add_edge("validator_visual_call", END)
 
-validator_builder.add_conditional_edges(
-    "validator_llm_call",
-    validator_should_continue,
-    ["validator_tool_node", "validator_force_finish", END],
-)
-
-validator_builder.add_edge("validator_tool_node", "validator_llm_call")
-validator_builder.add_edge("validator_force_finish", END)
-
-validator_graph = validator_builder.compile(name="Design Validator Graph")
+validator_graph = validator_builder.compile(name="Design Visual Validator Graph")

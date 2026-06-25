@@ -583,14 +583,23 @@ async def run_validator(
     """
 
     try:
+        validator_prompt = (
+            "Valida visualmente la pantalla actual de Penpot para handoff frontend. "
+            "Usa la imagen PNG exportada desde Penpot como fuente principal. "
+            "Evalúa estructura visual, layout, espaciado, legibilidad, accesibilidad básica "
+            "y preparación general para desarrollo frontend. Devuelve JSON válido."
+        )
+
+        original_user_request = state.get("changeme")
+
+        if original_user_request:
+            validator_prompt += (
+                "\n\nSolicitud original del usuario/contexto de diseño:\n"
+                f"{original_user_request}"
+            )
+
         validation_result = await validator_graph.ainvoke(
-            {
-                "changeme": (
-                    "Valida la pantalla actual de Penpot para handoff frontend. "
-                    "Inspecciona estructura, capas, tokens, componentes, layout "
-                    "y accesibilidad básica. Devuelve JSON válido."
-                )
-            }
+            {"changeme": validator_prompt}
         )
 
         validator_input_tokens = int(validation_result.get("input_tokens") or 0)
