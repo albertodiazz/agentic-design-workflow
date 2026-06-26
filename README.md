@@ -2,14 +2,15 @@
 
 ## Objetivo
 
-Este proyecto implementa un agente con LangGraph conectado a Penpot mediante MCP para crear, validar y corregir interfaces UI.
+Agente LangGraph conectado a Penpot mediante MCP para crear, validar y corregir interfaces UI.
 
-El workflow busca separar tres responsabilidades principales:
+El sistema separa tres responsabilidades:
 
 ```text
 Builder   -> crea o modifica diseño en Penpot
-Validator -> valida visual y estructuralmente el diseño
-Fixer     -> convierte el reporte del validator en instrucciones seguras para el builder
+Validator -> valida visual y estructuralmente el diseño actual
+Fixer     -> convierte el reporte del validator en instrucciones seguras
+Verifier  -> confirma si el auto-fix aplicado quedó reflejado en Penpot
 ```
 
 ## Stack
@@ -17,12 +18,12 @@ Fixer     -> convierte el reporte del validator en instrucciones seguras para el
 ```text
 LangGraph
 LangChain
-Mistral
+Mistral Vision
 Penpot MCP
 Python
 ```
 
-## Acciones principales
+## Acciones
 
 ```text
 build
@@ -32,13 +33,10 @@ validate_and_fix
 build_validate_and_fix
 ```
 
-## Workflow actual
-
-El flujo principal de validación funciona así:
+## Flujo de validación
 
 ```text
-prepare_input
--> run_validator
+run_validator
 -> validator_visual_call
 -> export_shape
 -> execute_code read-only
@@ -46,17 +44,19 @@ prepare_input
 -> validation_report
 ```
 
-El validator ya no depende solo de la imagen PNG. Ahora combina:
+El validator es **stateless**: no depende de runs anteriores, flags de fix ni planes previos. Siempre valida el diseño actual.
+
+Combina:
 
 ```text
-Imagen exportada desde Penpot
+PNG exportado desde Penpot
 +
-Estructura real de capas obtenida con execute_code read-only
+estructura real de capas vía execute_code read-only
 +
 DESIGN_CONTEXT_JSON
 ```
 
-Esto permite mapear regiones visuales a capas reales de Penpot usando:
+El contexto permite mapear regiones visuales a capas reales usando:
 
 ```text
 node_ref
@@ -67,87 +67,24 @@ path
 bbox
 ```
 
-Ejemplo:
-
-```json
-{
-  "visual_region": "login_button_background",
-  "matched_layer": {
-    "node_ref": "n_007",
-    "id": "...",
-    "name": "Rectangle",
-    "type": "rectangle",
-    "path": "LoginContainer / Rectangle[4]",
-    "bbox": {
-      "x": 724,
-      "y": 560,
-      "width": 240,
-      "height": 45
-    }
-  }
-}
-```
-
-## Auto-fix actual
-
-El validator genera un `auto_fix_plan` para correcciones seguras y determinísticas.
-
-Por ahora el auto-fix solo corrige renombrado semántico de capas. No modifica layout, colores, tamaños, textos visibles, componentes ni tokens.
-
-Ejemplo de correcciones aplicadas:
+## validate_only
 
 ```text
-Rectangle -> LoginCardBackground
-Text -> LoginTitleText
-Rectangle -> EmailInputBackground
-Text -> EmailInputLabel
-Rectangle -> PasswordInputBackground
-Text -> PasswordInputLabel
-Rectangle -> LoginButtonBackground
-Text -> LoginButtonText
+validate_only
+-> run_validator
+-> END
 ```
 
-## Checkpoint actual
-
-Estado del proyecto:
+Devuelve:
 
 ```text
-1. validate_only básico ✅
-2. export_shape PNG desde Penpot ✅
-3. lectura estructural con execute_code read-only ✅
-4. imagen + DESIGN_CONTEXT_JSON hacia Mistral Vision ✅
-5. mapeo visual a capas reales con node_ref ✅
-6. generación de auto_fix_plan para renombrado seguro ✅
-7. validate_and_fix ejecuta renombrado en Penpot ✅
-8. verificación post-fix estable ⬅️ pendiente
+validation_report
+passed
+score
+status
 ```
 
-Ya se comprobó que:
-
-```text
-- El validator obtiene estructura real de Penpot.
-- El validator puede asociar elementos visuales con capas reales.
-- El auto_fix_plan genera acciones seguras.
-- El builder aplica los renombres correctamente en Penpot.
-```
-
-## Problema actual
-
-Después de aplicar el fix, el grafo vuelve a ejecutar una validación visual completa con Mistral Vision.
-
-Esto puede fallar por timeout:
-
-```text
-mistral_network / ReadTimeout
-```
-
-El problema no está en el renombrado ni en Penpot. El problema está en que la revalidación post-fix depende de una segunda llamada visual pesada a Mistral.
-
-## Siguiente paso
-
-Separar la validación visual completa de la verificación estructural post-fix.
-
-Nuevo flujo recomendado:
+## validate_and_fix
 
 ```text
 validate_and_fix
@@ -158,42 +95,65 @@ validate_and_fix
 -> END
 ```
 
-La verificación post-fix debe ser determinística:
+`run_validator` produce los datos. El router decide pasar a `fix_design` solo si:
 
 ```text
-- usar execute_code
-- leer capas actuales de Penpot
-- comparar id contra new_name esperado
-- devolver all_applied true/false
+passed=false
+hay auto_fix_plan seguro
+fix_iterations < max_fix_iterations
 ```
 
-Esto evita depender de Mistral para comprobar si el renombrado fue aplicado.
+Después del fix **no se ejecuta otra validación visual completa** automáticamente.
 
-## Próxima implementación
+## Auto-fix
 
-Agregar un nuevo nodo:
+El auto-fix actual solo aplica renombrado semántico seguro de capas.
+
+Permitido:
 
 ```text
-verify_auto_fix_plan_applied
+rename_layer
 ```
 
-Este nodo debe:
+No permitido automáticamente:
 
 ```text
-1. Leer last_auto_fix_plan.
-2. Ejecutar execute_code en modo lectura.
-3. Buscar cada shape por id.
-4. Comparar actual_name contra expected_name.
-5. Devolver auto_fix_verified y auto_fix_verification.
+layout
+colores
+tamaños
+textos visibles
+componentes
+tokens
+accesibilidad avanzada
+estados interactivos
 ```
 
-Resultado esperado:
+El `auto_fix_plan` final debe ser determinístico y seguro. El LLM puede sugerir, pero Python normaliza referencias y genera el plan aplicable.
+
+## Verificación post-fix
+
+`verify_auto_fix_plan_applied` no usa LLM.
+
+Solo confirma si los cambios del plan aplicado quedaron en Penpot:
+
+```text
+- lee last_auto_fix_plan
+- ejecuta execute_code read-only
+- busca cada shape por id
+- compara actual_name contra expected_name
+- devuelve una bandera con timestamp
+```
+
+Ejemplo:
 
 ```json
 {
   "auto_fix_verified": true,
-  "auto_fix_verification": {
-    "all_applied": true,
+  "auto_fix_event": {
+    "type": "auto_fix_verification",
+    "status": "applied",
+    "verified_at": "2026-06-26T18:42:10Z",
+    "fix_iteration": 1,
     "checked_count": 8,
     "applied_count": 8,
     "failed_count": 0
@@ -201,17 +161,140 @@ Resultado esperado:
 }
 ```
 
-## Estado estable buscado
-
-El workflow debe quedar así:
+Esta verificación no modifica:
 
 ```text
-Validación visual para detectar problemas
--> auto_fix_plan seguro
--> builder aplica cambios
--> verificación estructural determinística
--> validación visual completa solo cuando sea necesario
+validation_report
+passed
+score
+status
 ```
 
-Esto permitirá que el sistema sea más confiable, rápido y menos dependiente de llamadas repetidas a Mistral Vision.
+La validación global sigue perteneciendo solo al validator.
 
+## Mistral Vision
+
+La llamada visual se hace desde `MistralVisionRunnable`.
+
+El payload real incluye:
+
+```text
+VISUAL_VALIDATOR_PROMPT
++
+changeme
++
+DESIGN_CONTEXT_JSON compacto
++
+image_url data:image/png;base64,...
+```
+
+Se confirmó que el payload real funciona contra Mistral, pero puede tardar más de 60s en prompts grandes. Por eso se usa timeout explícito y control de tokens.
+
+Variables recomendadas:
+
+```bash
+MISTRAL_VISION_TIMEOUT_MS=180000
+MISTRAL_VISION_MAX_TOKENS=6000
+MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS=6000
+MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS=2500
+```
+
+Para limitar contexto estructural:
+
+```bash
+PENPOT_VALIDATOR_MAX_CONTEXT_NODES=80
+PENPOT_VALIDATOR_CONTEXT_CHARS=9000
+```
+
+Para debug de export/payload:
+
+```bash
+PENPOT_VALIDATOR_DEBUG_EXPORT=1
+PENPOT_DEBUG_OUT=/tmp/penpot_debug
+```
+
+Archivos esperados:
+
+```text
+/tmp/penpot_debug/validator_export.png
+/tmp/penpot_debug/validator_export.png.data_url.txt
+/tmp/penpot_debug/validator_visual_prompt.txt
+/tmp/penpot_debug/validator_design_context.json
+/tmp/penpot_debug/validator_payload_debug.json
+```
+
+## Prueba directa de Mistral
+
+Probar el payload real desde terminal:
+
+```bash
+curl -v \
+  --connect-timeout 10 \
+  --max-time 180 \
+  -w "\nHTTP=%{http_code} STARTTRANSFER=%{time_starttransfer}s TOTAL=%{time_total}s SIZE_UPLOAD=%{size_upload}\n" \
+  https://api.mistral.ai/v1/chat/completions \
+  -H "Authorization: Bearer $MISTRAL_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/penpot_debug/validator_payload_debug.json
+```
+
+Interpretación rápida:
+
+```text
+HTTP 200 y tarda >60s -> subir timeout del cliente
+HTTP 400              -> payload mal formado
+HTTP 401/403          -> API key/permisos
+HTTP 429              -> rate limit
+ReadTimeout           -> timeout o payload demasiado pesado
+```
+
+## Scope recomendado
+
+Para diseños pesados, validar por selección o frame específico:
+
+```bash
+PENPOT_VALIDATOR_SHAPE_ID=selection
+```
+
+Ajustes rápidos:
+
+```text
+Pantalla chica:
+  nodes 40-80
+  max_tokens 3000
+  timeout 120s
+
+Pantalla mediana:
+  nodes 80
+  max_tokens 6000
+  timeout 180s
+
+Pantalla pesada:
+  validar por frame/selección
+  nodes 40-80
+  timeout 180-240s
+```
+
+## Estado actual
+
+```text
+1. validate_only básico ✅
+2. export_shape PNG desde Penpot ✅
+3. lectura estructural con execute_code read-only ✅
+4. imagen + DESIGN_CONTEXT_JSON hacia Mistral Vision ✅
+5. mapeo visual a capas reales con node_ref ✅
+6. generación de auto_fix_plan seguro ✅
+7. validate_and_fix ejecuta renombrado en Penpot ✅
+8. verify_auto_fix_plan_applied con timestamp ✅
+9. timeout explícito para Mistral Vision ✅
+```
+
+## Regla de arquitectura
+
+```text
+Validator = evalúa el diseño actual
+Fixer     = aplica un subconjunto seguro del reporte
+Verifier  = confirma si ese subconjunto se aplicó
+```
+
+No mezclar esas responsabilidades.
