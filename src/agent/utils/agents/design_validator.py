@@ -14,9 +14,10 @@ Important architecture rule preserved:
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 import os
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -40,6 +41,7 @@ from agent.utils.penpot_image_export import (
     extract_png_base64_from_export_shape,
     png_base64_to_data_url,
     save_debug_png_export,
+    to_plain,
 )
 
 
@@ -60,26 +62,36 @@ PENPOT_WRITE_TOOLS_PATH = AGENT_ROOT_DIR / "utils" / "tool_policies" / "penpot_w
 VISUAL_VALIDATOR_PROMPT = """
 Eres un agente validador visual de diseño UI conectado a Penpot mediante MCP.
 
-Vas a recibir una imagen PNG exportada desde Penpot. Tu tarea es evaluar si la pantalla está lista para handoff frontend.
+Vas a recibir dos fuentes de evidencia:
+1. Una imagen PNG exportada desde Penpot.
+2. Un JSON llamado DESIGN_CONTEXT_JSON con estructura real de Penpot: tools usadas, capas, nombres, tipos, textos, bounding boxes, jerarquía parcial y componentes cuando estén disponibles.
+
+Tu tarea es evaluar si la pantalla está lista para handoff frontend y asociar hallazgos visuales con capas/componentes concretos de Penpot.
 
 Debes responder únicamente con JSON válido. No uses Markdown. No agregues explicación fuera del JSON.
 
-Evalúa de forma visual:
-- existencia de una pantalla clara
-- jerarquía visual
+Reglas importantes:
+- Usa la imagen como evidencia visual.
+- Usa DESIGN_CONTEXT_JSON para mapear lo visible contra capas reales.
+- No inventes IDs, nombres ni paths. Si no hay match claro, usa affected_layers: [].
+- Usa `node_ref` como identificador primario para referenciar capas. Si puedes asociar una región con una capa, copia exactamente node_ref, id, name, type y path desde DESIGN_CONTEXT_JSON.
+- Cuando detectes un problema, intenta asociarlo con capas usando bbox, texto, nombre, tipo, jerarquía y posición visual.
+- Si una capa tiene nombre genérico como "Rectangle 1", "Text 2" o "Group 3", evalúa si su función visual puede inferirse: background, card, button, input, heading, label, icon, image, container.
+- Si no puedes verificar tokens o componentes, marca el check como "unknown" o "warning", pero explica qué faltó.
+
+Evalúa:
+- existencia de una pantalla o frame principal
+- relación entre estructura visual y estructura de capas
+- claridad semántica de nombres de capas
+- uso aparente de componentes reutilizables
 - layout y espaciado
 - legibilidad de textos
 - accesibilidad básica
 - consistencia visual
-- preparación general para desarrollo frontend
-
-Limitaciones:
-- Solo puedes evaluar lo visible en la imagen y el contexto textual recibido.
-- Si no puedes verificar nombres de capas, tokens o componentes desde la imagen, marca esos checks como "unknown" o "warning".
-- No inventes detalles internos que no sean visibles.
+- preparación para handoff frontend
 
 Criterio simple para passed:
-- passed=true si score >= 70, la pantalla parece entendible para desarrollo y no hay problemas graves evidentes.
+- passed=true si score >= 70, la pantalla parece entendible para desarrollo y no hay problemas critical/high evidentes.
 - passed=false si la información es insuficiente, la pantalla no es clara, hay problemas graves o score < 70.
 
 Valores permitidos para checks.*.status:
@@ -104,8 +116,33 @@ Devuelve exactamente esta estructura JSON:
   "score": 0,
   "status": "not_ready",
   "summary": "",
+  "design_context_summary": {
+    "root_shape_id": "",
+    "node_count": 0,
+    "available_sources": [],
+    "failed_sources": []
+  },
+  "visual_structure_map": [
+    {
+      "visual_region": "",
+      "inferred_role": "",
+      "matched_layer": {
+        "node_ref": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "path": ""
+      },
+      "confidence": 0.0
+    }
+  ],
   "checks": {
     "screen_structure": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "visual_structure_mapping": {
       "status": "unknown",
       "score": 0,
       "notes": []
@@ -141,7 +178,23 @@ Devuelve exactamente esta estructura JSON:
       "notes": []
     }
   },
-  "issues": [],
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "",
+      "message": "",
+      "affected_layers": [
+        {
+          "node_ref": "",
+          "id": "",
+          "name": "",
+          "type": "",
+          "path": ""
+        }
+      ],
+      "recommendation": ""
+    }
+  ],
   "required_fixes": [],
   "suggested_structure": "",
   "developer_notes": [],
@@ -241,6 +294,8 @@ class ValidatorOutputState(TypedDict, total=False):
     token_window_used: int
     token_gate_waited: bool
 
+    design_context: dict[str, Any]
+
 
 class ValidatorState(TypedDict, total=False):
     changeme: NotRequired[str]
@@ -256,6 +311,8 @@ class ValidatorState(TypedDict, total=False):
     token_window_used: NotRequired[int]
     token_gate_waited: NotRequired[bool]
 
+    design_context: NotRequired[dict[str, Any]]
+
 
 # ---------------------------------------------------------------------
 # MCP tools: read-only
@@ -264,6 +321,7 @@ class ValidatorState(TypedDict, total=False):
 _penpot_client: MultiServerMCPClient | None = None
 _validator_tools: list[Any] | None = None
 _validator_tools_by_name: dict[str, Any] = {}
+_internal_tools_by_name: dict[str, Any] = {}
 _validator_tool_policy: ValidatorToolPolicy | None = None
 
 
@@ -298,6 +356,7 @@ async def get_validator_tools() -> list[Any]:
     global _penpot_client
     global _validator_tools
     global _validator_tools_by_name
+    global _internal_tools_by_name
     global _validator_tool_policy
 
     if _validator_tools is not None:
@@ -324,6 +383,18 @@ async def get_validator_tools() -> list[Any]:
 
     all_tools = await _penpot_client.get_tools()
 
+    # Internal tools are NOT exposed to the model.
+    # Python uses execute_code only with a fixed read-only script.
+    _internal_tools_by_name = {}
+    for tool in all_tools:
+        tool_name = getattr(tool, "name", "")
+        normalized_name = normalize_tool_name(tool_name)
+
+        if normalized_name == "execute_code":
+            _internal_tools_by_name[tool_name] = tool
+            _internal_tools_by_name[normalized_name] = tool
+
+    # Read-only validator tools. These remain safe to expose to validator logic.
     _validator_tools = [
         tool
         for tool in all_tools
@@ -347,7 +418,6 @@ async def get_validator_tools() -> list[Any]:
         )
 
     return _validator_tools
-
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -471,13 +541,800 @@ def make_error_report(
     }
 
 
-def build_visual_prompt(context: str | None) -> str:
+MAX_CONTEXT_CHARS = int(os.getenv("PENPOT_VALIDATOR_CONTEXT_CHARS", "9000"))
+MAX_CONTEXT_NODES = int(os.getenv("PENPOT_VALIDATOR_MAX_CONTEXT_NODES", "80"))
+
+
+READ_ONLY_STRUCTURE_SCRIPT = r"""
+function toArray(value) {
+  if (!value) return [];
+  try {
+    return Array.from(value);
+  } catch (err) {
+    return [];
+  }
+}
+
+function asNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return null;
+}
+
+function asString(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value);
+}
+
+function safePlain(value, maxItems) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, maxItems || 8).map(function (item) {
+      return safePlain(item, maxItems);
+    });
+  }
+
+  try {
+    var out = {};
+    var keys = Object.keys(value).slice(0, maxItems || 12);
+
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var item = value[key];
+
+      if (typeof item !== "function") {
+        out[key] = safePlain(item, maxItems);
+      }
+    }
+
+    return out;
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function readText(shape) {
+  if (!shape) return null;
+
+  if (shape.characters !== undefined && shape.characters !== null) {
+    return String(shape.characters);
+  }
+
+  if (shape.text !== undefined && shape.text !== null) {
+    return String(shape.text);
+  }
+
+  if (shape.content !== undefined && shape.content !== null) {
+    return String(shape.content);
+  }
+
+  return null;
+}
+
+function readChildren(shape) {
+  if (!shape) return [];
+
+  var candidates = [
+    shape.children,
+    shape.shapes,
+    shape.items
+  ];
+
+  for (var i = 0; i < candidates.length; i++) {
+    var arr = toArray(candidates[i]);
+    if (arr.length > 0) {
+      return arr;
+    }
+  }
+
+  return [];
+}
+
+function serializeShape(shape, depth, path) {
+  if (!shape || depth > 8) {
+    return null;
+  }
+
+  var id = asString(shape.id);
+  var type = asString(shape.type || shape.shapeType);
+  var name = asString(shape.name);
+  var label = name || type || id || "unnamed";
+  var currentPath = path ? path + " / " + label : label;
+
+  var children = [];
+  var rawChildren = readChildren(shape);
+
+  for (var i = 0; i < rawChildren.length; i++) {
+    var child = serializeShape(rawChildren[i], depth + 1, currentPath);
+    if (child) {
+      children.push(child);
+    }
+  }
+
+  return {
+    id: id,
+    name: name,
+    type: type,
+    path: currentPath,
+
+    x: asNumber(shape.x),
+    y: asNumber(shape.y),
+    width: asNumber(shape.width),
+    height: asNumber(shape.height),
+    rotation: asNumber(shape.rotation),
+
+    visible: shape.visible !== false && shape.hidden !== true,
+    locked: shape.locked === true,
+
+    text: readText(shape),
+
+    fills: safePlain(shape.fills, 6),
+    strokes: safePlain(shape.strokes, 6),
+    opacity: asNumber(shape.opacity),
+
+    fontFamily: shape.fontFamily ? String(shape.fontFamily) : null,
+    fontSize: asNumber(shape.fontSize),
+    fontWeight: shape.fontWeight ? String(shape.fontWeight) : null,
+    lineHeight: shape.lineHeight ? safePlain(shape.lineHeight, 4) : null,
+
+    componentId: shape.componentId ? String(shape.componentId) : null,
+    componentName: shape.component && shape.component.name ? String(shape.component.name) : null,
+
+    children: children
+  };
+}
+
+var selection = toArray(penpot.selection);
+var currentPage = penpot.currentPage || null;
+var pageChildren = currentPage ? readChildren(currentPage) : [];
+var roots = selection.length > 0 ? selection : pageChildren;
+
+var result = {
+  file: {
+    id: penpot.currentFile && penpot.currentFile.id ? String(penpot.currentFile.id) : "",
+    name: penpot.currentFile && penpot.currentFile.name ? String(penpot.currentFile.name) : ""
+  },
+  page: {
+    id: currentPage && currentPage.id ? String(currentPage.id) : "",
+    name: currentPage && currentPage.name ? String(currentPage.name) : ""
+  },
+  root_source: selection.length > 0 ? "selection" : "current_page_children",
+  selection_count: selection.length,
+  root_count: roots.length,
+  roots: roots.map(function (shape) {
+    return serializeShape(shape, 0, "");
+  }).filter(Boolean)
+};
+
+return JSON.stringify(result);
+"""
+
+
+def extract_text_from_tool_result(result: Any) -> str:
+    plain = to_plain(result)
+
+    if isinstance(plain, str):
+        return plain
+
+    if isinstance(plain, dict):
+        for key in ["result", "text", "output", "content"]:
+            value = plain.get(key)
+
+            if isinstance(value, str):
+                return value
+
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    if isinstance(item, dict):
+                        text = item.get("text") or item.get("content")
+                        if isinstance(text, str):
+                            parts.append(text)
+                    elif isinstance(item, str):
+                        parts.append(item)
+
+                if parts:
+                    return "\n".join(parts)
+
+        return json.dumps(plain, ensure_ascii=False, default=str)
+
+    if isinstance(plain, list):
+        parts: list[str] = []
+
+        for item in plain:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif item.get("type") == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+
+        if parts:
+            return "\n".join(parts)
+
+        return json.dumps(plain, ensure_ascii=False, default=str)
+
+    return str(plain)
+
+
+def parse_json_object_from_text(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        inner = parsed.get("result")
+        if isinstance(inner, str):
+            inner_parsed = parse_json_object_from_text(inner)
+            if isinstance(inner_parsed, dict):
+                return inner_parsed
+
+        return parsed
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(parsed, dict):
+            inner = parsed.get("result")
+            if isinstance(inner, str):
+                inner_parsed = parse_json_object_from_text(inner)
+                if isinstance(inner_parsed, dict):
+                    return inner_parsed
+
+            return parsed
+
+    return None
+
+
+def compact_for_prompt(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = 6,
+    max_items: int = 40,
+    max_string: int = 600,
+) -> Any:
+    value = to_plain(value)
+
+    if depth >= max_depth:
+        return "<truncated: max depth>"
+
+    if isinstance(value, str):
+        if len(value) > max_string:
+            return value[:max_string] + "...<truncated>"
+        return value
+
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+
+    if isinstance(value, list):
+        items = [
+            compact_for_prompt(
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string=max_string,
+            )
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            items.append(f"<truncated: {len(value) - max_items} more items>")
+        return items
+
+    if isinstance(value, dict):
+        preferred_keys = [
+            "id", "name", "type", "path", "x", "y", "width", "height",
+            "visible", "text", "fontFamily", "fontSize", "fontWeight",
+            "componentId", "componentName", "children", "roots", "nodes",
+            "summary", "source_errors", "overview_preview",
+        ]
+        ordered_keys = [key for key in preferred_keys if key in value]
+        ordered_keys.extend(key for key in value.keys() if key not in ordered_keys)
+
+        result: dict[str, Any] = {}
+        for key in ordered_keys[:max_items]:
+            result[str(key)] = compact_for_prompt(
+                value[key],
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string=max_string,
+            )
+
+        if len(value) > max_items:
+            result["<truncated>"] = f"{len(value) - max_items} more keys"
+
+        return result
+
+    return str(value)
+
+
+def json_for_prompt(value: Any, *, max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    text = json.dumps(
+        compact_for_prompt(value),
+        ensure_ascii=False,
+        default=str,
+        indent=2,
+    )
+
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n...<truncated design_context>"
+
+    return text
+
+
+def infer_role_guess(node: dict[str, Any]) -> str | None:
+    """Small deterministic hint for the model; it does not replace validation."""
+    node_type = str(node.get("type") or "").lower()
+    name = str(node.get("name") or "").lower()
+    text = str(node.get("text") or "").lower()
+    width = node.get("width") or 0
+    height = node.get("height") or 0
+
+    combined = f"{name} {text} {node_type}"
+
+    if node_type == "text" or "text" in node_type:
+        if any(word in combined for word in ["login", "iniciar", "button", "submit"]):
+            return "button_text"
+        if any(word in combined for word in ["email", "password", "contraseña", "usuario"]):
+            return "label_or_placeholder"
+        return "text"
+
+    if any(word in combined for word in ["button", "btn", "login", "submit", "iniciar"]):
+        return "button"
+
+    if any(word in combined for word in ["input", "field", "email", "password", "contraseña"]):
+        return "input"
+
+    try:
+        numeric_width = float(width or 0)
+        numeric_height = float(height or 0)
+    except Exception:
+        numeric_width = 0
+        numeric_height = 0
+
+    if numeric_width >= 180 and 32 <= numeric_height <= 80:
+        return "input_or_button_rect"
+
+    if numeric_width >= 250 and numeric_height >= 250:
+        return "container_or_background"
+
+    if node_type in {"group", "frame", "board"} or "group" in node_type:
+        return "container"
+
+    return None
+
+
+def make_layer_ref_from_node(node: dict[str, Any]) -> dict[str, Any]:
+    bbox = node.get("bbox")
+    if not isinstance(bbox, dict):
+        bbox = {
+            "x": node.get("x"),
+            "y": node.get("y"),
+            "width": node.get("width"),
+            "height": node.get("height"),
+        }
+
+    return {
+        "node_ref": node.get("node_ref", ""),
+        "id": node.get("id", ""),
+        "name": node.get("name", ""),
+        "type": node.get("type", ""),
+        "path": node.get("path", ""),
+        "bbox": bbox,
+    }
+
+
+def flatten_design_nodes(
+    roots: list[Any],
+    *,
+    max_nodes: int = MAX_CONTEXT_NODES,
+) -> list[dict[str, Any]]:
+    """
+    Flatten the Penpot tree into stable, model-friendly nodes.
+
+    Adds:
+    - node_ref: compact stable reference for the model in this validation run.
+    - unique path: repeated sibling labels get [1], [2], etc.
+    - raw_path: path as reported by the Penpot script.
+    - bbox: grouped geometry object.
+    - role_guess: deterministic hint to improve visual mapping.
+    """
+    nodes: list[dict[str, Any]] = []
+
+    def base_label(node: Any) -> str:
+        if not isinstance(node, dict):
+            return "unnamed"
+
+        name = str(node.get("name") or "").strip()
+        node_type = str(node.get("type") or "").strip()
+        node_id = str(node.get("id") or "").strip()
+        return name or node_type or node_id or "unnamed"
+
+    def child_labels(children: list[Any]) -> list[str]:
+        return [base_label(child) for child in children]
+
+    def walk(node: Any, *, path: str, depth: int) -> None:
+        if len(nodes) >= max_nodes:
+            return
+
+        if not isinstance(node, dict):
+            return
+
+        node_ref = f"n_{len(nodes):03d}"
+        bbox = {
+            "x": node.get("x"),
+            "y": node.get("y"),
+            "width": node.get("width"),
+            "height": node.get("height"),
+        }
+
+        flat_node = {
+            "node_ref": node_ref,
+            "id": node.get("id", ""),
+            "name": node.get("name", ""),
+            "type": node.get("type", ""),
+            "path": path,
+            "raw_path": node.get("path", ""),
+            "depth": depth,
+            "x": node.get("x"),
+            "y": node.get("y"),
+            "width": node.get("width"),
+            "height": node.get("height"),
+            "bbox": bbox,
+            "visible": node.get("visible", True),
+            "text": node.get("text"),
+            "fontFamily": node.get("fontFamily"),
+            "fontSize": node.get("fontSize"),
+            "fontWeight": node.get("fontWeight"),
+            "componentId": node.get("componentId"),
+            "componentName": node.get("componentName"),
+        }
+        flat_node["role_guess"] = infer_role_guess(flat_node)
+        nodes.append(flat_node)
+
+        children = node.get("children", [])
+        if not isinstance(children, list):
+            return
+
+        labels = child_labels(children)
+        counts = Counter(labels)
+        seen: Counter[str] = Counter()
+
+        for child, label in zip(children, labels):
+            seen[label] += 1
+            unique_label = label
+            if counts[label] > 1:
+                unique_label = f"{label}[{seen[label]}]"
+
+            child_path = f"{path} / {unique_label}" if path else unique_label
+            walk(child, path=child_path, depth=depth + 1)
+
+    root_labels = child_labels(roots)
+    root_counts = Counter(root_labels)
+    root_seen: Counter[str] = Counter()
+
+    for root, label in zip(roots, root_labels):
+        root_seen[label] += 1
+        unique_label = label
+        if root_counts[label] > 1:
+            unique_label = f"{label}[{root_seen[label]}]"
+        walk(root, path=unique_label, depth=0)
+
+    return nodes
+
+async def collect_design_context(shape_id: str) -> dict[str, Any]:
+    """
+    Read Penpot structure deterministically before the vision call.
+
+    The model never decides the code. Python invokes execute_code with a fixed
+    read-only script and combines it with high_level_overview.
+    """
+    await get_validator_tools()
+
+    source_errors: dict[str, str] = {}
+    available_sources: list[str] = []
+    overview_preview: str | None = None
+
+    overview_tool = _validator_tools_by_name.get("high_level_overview")
+    if overview_tool is not None:
+        try:
+            overview_result = await overview_tool.ainvoke({})
+            overview_text = extract_text_from_tool_result(overview_result)
+            overview_preview = overview_text[:800]
+            available_sources.append("high_level_overview")
+        except Exception as exc:
+            source_errors["high_level_overview"] = repr(exc)
+    else:
+        source_errors["high_level_overview"] = "tool_not_available"
+
+    execute_code = _internal_tools_by_name.get("execute_code")
+    structure: dict[str, Any] = {}
+
+    if execute_code is None:
+        source_errors["execute_code"] = (
+            "execute_code no está disponible en el MCP server. "
+            "No se puede obtener estructura real de capas."
+        )
+    else:
+        try:
+            raw_result = await execute_code.ainvoke(
+                {
+                    "code": READ_ONLY_STRUCTURE_SCRIPT,
+                }
+            )
+            raw_text = extract_text_from_tool_result(raw_result)
+            parsed = parse_json_object_from_text(raw_text)
+
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "execute_code no devolvió JSON parseable. "
+                    f"Preview: {raw_text[:1000]}"
+                )
+
+            structure = parsed
+            available_sources.append("execute_code")
+
+        except Exception as exc:
+            source_errors["execute_code"] = repr(exc)
+
+    roots = structure.get("roots", [])
+    if not isinstance(roots, list):
+        roots = []
+
+    nodes = flatten_design_nodes(roots)
+
+    return {
+        "root_shape_id": shape_id,
+        "summary": {
+            "root_shape_id": shape_id,
+            "page": structure.get("page", {}),
+            "file": structure.get("file", {}),
+            "root_source": structure.get("root_source"),
+            "selection_count": structure.get("selection_count", 0),
+            "root_count": structure.get("root_count", 0),
+            "node_count": len(nodes),
+            "available_sources": available_sources,
+            "failed_sources": list(source_errors.keys()),
+        },
+        "source_errors": source_errors,
+        "overview_preview": overview_preview,
+        # Keep prompt payload compact. The full tree can be huge and can cause
+        # vision request timeouts. Use the flattened node list for matching.
+        "nodes": nodes[:MAX_CONTEXT_NODES],
+        "roots": [],
+        "instruction": (
+            "Mapea regiones visibles de la imagen a estos nodos reales de Penpot. "
+            "Usa id, name, type, path, text y bbox aproximado. No inventes IDs. "
+            "Si no puedes asociar una región visual a una capa, deja affected_layers vacío."
+        ),
+    }
+
+
+def build_node_indexes(design_context: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    nodes = design_context.get("nodes", [])
+    if not isinstance(nodes, list):
+        nodes = []
+
+    by_ref: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        node_ref = str(node.get("node_ref") or "").strip()
+        node_id = str(node.get("id") or "").strip()
+
+        if node_ref:
+            by_ref[node_ref] = node
+        if node_id:
+            by_id[node_id] = node
+
+    return by_ref, by_id
+
+
+def normalize_layer_reference(
+    layer: Any,
+    *,
+    nodes_by_ref: dict[str, dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not isinstance(layer, dict):
+        return None
+
+    node_ref = str(layer.get("node_ref") or "").strip()
+    node_id = str(layer.get("id") or "").strip()
+
+    node: dict[str, Any] | None = None
+
+    if node_ref and node_ref in nodes_by_ref:
+        node = nodes_by_ref[node_ref]
+    elif node_id and node_id in nodes_by_id:
+        node = nodes_by_id[node_id]
+
+    if node is None:
+        return None
+
+    return make_layer_ref_from_node(node)
+
+
+def normalize_layers_list(
+    layers: Any,
+    *,
+    nodes_by_ref: dict[str, dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    if not isinstance(layers, list):
+        return [], 0
+
+    normalized: list[dict[str, Any]] = []
+    invalid_count = 0
+    seen: set[tuple[str, str]] = set()
+
+    for layer in layers:
+        normalized_layer = normalize_layer_reference(
+            layer,
+            nodes_by_ref=nodes_by_ref,
+            nodes_by_id=nodes_by_id,
+        )
+
+        if normalized_layer is None:
+            invalid_count += 1
+            continue
+
+        key = (
+            str(normalized_layer.get("node_ref") or ""),
+            str(normalized_layer.get("id") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(normalized_layer)
+
+    return normalized, invalid_count
+
+
+def normalize_report_layer_references(
+    report: dict[str, Any],
+    design_context: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Make model layer references safe before the fixer uses them.
+
+    - Uses node_ref first, id second.
+    - Corrects stale/wrong name/type/path/bbox from the model.
+    - Removes references that do not exist in design_context.nodes.
+    """
+    nodes_by_ref, nodes_by_id = build_node_indexes(design_context)
+    invalid_refs = 0
+
+    visual_map = report.get("visual_structure_map", [])
+    if isinstance(visual_map, list):
+        normalized_map: list[dict[str, Any]] = []
+
+        for item in visual_map:
+            if not isinstance(item, dict):
+                continue
+
+            matched_layer = item.get("matched_layer")
+            normalized_layer = normalize_layer_reference(
+                matched_layer,
+                nodes_by_ref=nodes_by_ref,
+                nodes_by_id=nodes_by_id,
+            )
+
+            if normalized_layer is None:
+                invalid_refs += 1
+                normalized_layer = {
+                    "node_ref": "",
+                    "id": "",
+                    "name": "",
+                    "type": "",
+                    "path": "",
+                    "bbox": None,
+                }
+
+            normalized_map.append({**item, "matched_layer": normalized_layer})
+
+        report["visual_structure_map"] = normalized_map
+
+    issues = report.get("issues", [])
+    if isinstance(issues, list):
+        normalized_issues: list[dict[str, Any]] = []
+
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+
+            normalized_layers, issue_invalid = normalize_layers_list(
+                issue.get("affected_layers", []),
+                nodes_by_ref=nodes_by_ref,
+                nodes_by_id=nodes_by_id,
+            )
+            invalid_refs += issue_invalid
+            normalized_issues.append({**issue, "affected_layers": normalized_layers})
+
+        report["issues"] = normalized_issues
+
+    if invalid_refs:
+        notes = report.get("developer_notes", [])
+        if not isinstance(notes, list):
+            notes = [str(notes)]
+        notes.append(
+            f"Layer reference normalization removed or corrected {invalid_refs} invalid model references."
+        )
+        report["developer_notes"] = notes
+
+    return report
+
+def make_compact_design_context(design_context: dict[str, Any]) -> dict[str, Any]:
+    """Return only the information Mistral needs for visual-layer mapping."""
+    return {
+        "root_shape_id": design_context.get("root_shape_id"),
+        "summary": design_context.get("summary", {}),
+        "source_errors": design_context.get("source_errors", {}),
+        "overview_preview": design_context.get("overview_preview"),
+        "nodes": design_context.get("nodes", [])[:MAX_CONTEXT_NODES],
+        "instruction": design_context.get("instruction", ""),
+    }
+
+
+def attach_design_context_to_report(
+    report: dict[str, Any],
+    design_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve context diagnostics even when Mistral/export validation fails."""
+    report.setdefault("design_context_summary", design_context.get("summary", {}))
+    report.setdefault("source_errors", design_context.get("source_errors", {}))
+    report.setdefault("visual_structure_map", [])
+    return report
+
+
+def build_visual_prompt(
+    context: str | None,
+    design_context: dict[str, Any] | None = None,
+) -> str:
     prompt = VISUAL_VALIDATOR_PROMPT
 
     if context:
         prompt += (
             "\n\nContexto adicional del workflow o solicitud original del usuario:\n"
             f"{context}"
+        )
+
+    if design_context:
+        prompt += (
+            "\n\nInstrucciones estrictas para referencias de capas:\n"
+            "- Cada nodo trae `node_ref`. Usa `node_ref` como referencia primaria.\n"
+            "- Cuando llenes matched_layer o affected_layers, copia exactamente node_ref, id, name, type y path desde DESIGN_CONTEXT_JSON.\n"
+            "- No combines el id de una capa con el name/type/path de otra.\n"
+            "- Si dudas entre dos capas, elige la que coincida mejor por bbox/text/type y baja confidence.\n"
+            "- Si no hay match claro, deja la referencia vacía.\n"
+            "\n\nDESIGN_CONTEXT_JSON:\n"
+            f"{json_for_prompt(design_context)}"
         )
 
     return prompt
@@ -545,6 +1402,7 @@ async def validator_prepare_input(
         "passed": None,
         "score": None,
         "status": None,
+        "design_context": {},
     }
 
 
@@ -562,6 +1420,8 @@ async def validator_visual_call(
         export_shape = _validator_tools_by_name["export_shape"]
 
         shape_id = os.getenv("PENPOT_VALIDATOR_SHAPE_ID", "selection")
+
+        design_context = await collect_design_context(shape_id)
 
         export_result = await export_shape.ainvoke(
             {
@@ -586,9 +1446,14 @@ async def validator_visual_call(
                     "PENPOT_VALIDATOR_SHAPE_ID con un shapeId exportable."
                 ),
             )
-            return extract_output_from_report(report)
+            report = attach_design_context_to_report(report, design_context)
+            return {
+                **extract_output_from_report(report),
+                "design_context": design_context,
+            }
 
         assert_valid_png_base64(image_b64)
+
         if os.getenv("PENPOT_VALIDATOR_DEBUG_EXPORT", "0") == "1":
             await asyncio.to_thread(
                 save_debug_png_export,
@@ -596,7 +1461,6 @@ async def validator_visual_call(
                 output_dir=os.getenv("PENPOT_DEBUG_OUT", "/tmp/penpot_debug"),
                 stem="validator_export",
             )
-
 
         image_data_url = png_base64_to_data_url(image_b64)
 
@@ -607,22 +1471,31 @@ async def validator_visual_call(
             response_format={"type": "json_object"},
         )
 
-        visual_prompt = build_visual_prompt(state.get("changeme"))
+        compact_design_context = make_compact_design_context(design_context)
+
+        visual_prompt = build_visual_prompt(
+            state.get("changeme"),
+            design_context=compact_design_context,
+        )
 
         try:
             metered_result = await metered_ainvoke(
                 vision_runnable,
                 [HumanMessage(content=visual_prompt)],
                 estimated_completion_tokens=int(
-                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "1500")
+                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "1200")
                 ),
                 extra_estimated_tokens=int(
-                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "3000")
+                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "2000")
                 ),
             )
         except Exception as exc:
             report = make_mistral_error_report(exc)
-            return extract_output_from_report(report)
+            report = attach_design_context_to_report(report, design_context)
+            return {
+                **extract_output_from_report(report),
+                "design_context": design_context,
+            }
 
         report = parse_json_report(metered_result.ai_message.content)
 
@@ -634,9 +1507,14 @@ async def validator_visual_call(
                 recommendation="Revisar prompt visual y response_format json_object.",
             )
 
+        if isinstance(report, dict):
+            report = attach_design_context_to_report(report, design_context)
+            report = normalize_report_layer_references(report, design_context)
+
         return {
             **extract_output_from_report(report),
             **usage_updates_from_metered_result(state, metered_result),
+            "design_context": design_context,
         }
 
     except Exception as exc:
