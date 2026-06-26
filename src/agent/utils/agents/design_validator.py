@@ -1706,6 +1706,7 @@ async def validator_visual_call(
             model=os.getenv("MISTRAL_VISION_MODEL", "mistral-large-2512"),
             temperature=0,
             response_format={"type": "json_object"},
+            max_tokens=int(os.getenv("MISTRAL_VISION_MAX_TOKENS", "6000")),
         )
 
         compact_design_context = make_compact_design_context(design_context)
@@ -1720,10 +1721,10 @@ async def validator_visual_call(
                 vision_runnable,
                 [HumanMessage(content=visual_prompt)],
                 estimated_completion_tokens=int(
-                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "1200")
+                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "6000")
                 ),
                 extra_estimated_tokens=int(
-                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "2000")
+                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "2500")
                 ),
             )
         except Exception as exc:

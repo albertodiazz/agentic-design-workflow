@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Literal
@@ -245,6 +246,10 @@ class OutputState(TypedDict, total=False):
     token_window_used: int
     token_gate_waited: bool
 
+    auto_fix_verified: bool
+    auto_fix_event: dict[str, Any] | None
+    auto_fix_verification: dict[str, Any] | None
+
 
 class OverallState(MessagesState, total=False):
     changeme: NotRequired[str]
@@ -267,6 +272,14 @@ class OverallState(MessagesState, total=False):
     token_gate_waited: NotRequired[bool]
 
     skip_validation: NotRequired[bool]
+
+    # Debug/event state for post-fix verification.
+    # This is intentionally separate from validation_report / passed / score / status.
+    last_auto_fix_plan: NotRequired[list[dict[str, Any]]]
+    post_fix_validation_mode: NotRequired[str | None]
+    auto_fix_verified: NotRequired[bool]
+    auto_fix_event: NotRequired[dict[str, Any] | None]
+    auto_fix_verification: NotRequired[dict[str, Any] | None]
 
 
 # ---------------------------------------------------------------------
@@ -336,10 +349,14 @@ async def get_builder_tools() -> list[Any]:
         if is_builder_tool(tool, _builder_tool_policy)
     ]
 
-    _builder_tools_by_name = {
-        tool.name: tool
-        for tool in _builder_tools
-    }
+    _builder_tools_by_name = {}
+
+    for tool in _builder_tools:
+        tool_name = getattr(tool, "name", "")
+        normalized_name = normalize_tool_name(tool_name)
+
+        _builder_tools_by_name[tool_name] = tool
+        _builder_tools_by_name[normalized_name] = tool
 
     if not _builder_tools:
         available_tools = [
@@ -381,28 +398,204 @@ def validation_passed(state: OverallState) -> bool:
     return bool(state.get("passed", False))
 
 
-def has_auto_fix_plan(state: OverallState) -> bool:
-    report = state.get("validation_report")
+def utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
-    if not isinstance(report, dict):
-        return False
 
-    plan = report.get("auto_fix_plan", [])
+def get_auto_fix_plan_from_report(
+    validation_report: Any,
+) -> list[dict[str, Any]]:
+    """Return executable auto-fix actions from a validation report.
 
-    if not isinstance(plan, list):
-        return False
+    The validator is stateless and only proposes auto_fix_plan.
+    fix_design copies the plan into last_auto_fix_plan when it attempts to apply it.
+    """
+    if not isinstance(validation_report, dict):
+        return []
 
-    for item in plan:
+    raw_plan = validation_report.get("auto_fix_plan", [])
+
+    if not isinstance(raw_plan, list):
+        return []
+
+    executable_plan: list[dict[str, Any]] = []
+
+    for item in raw_plan:
         if not isinstance(item, dict):
             continue
 
         if item.get("action") != "rename_layer":
             continue
 
-        if item.get("id") and item.get("new_name"):
-            return True
+        if not item.get("id") or not item.get("new_name"):
+            continue
 
-    return False
+        executable_plan.append(item)
+
+    return executable_plan
+
+
+def has_auto_fix_plan(state: OverallState) -> bool:
+    return bool(get_auto_fix_plan_from_report(state.get("validation_report")))
+
+
+def parse_tool_json_result(value: Any) -> dict[str, Any]:
+    """Parse JSON-ish output returned by Penpot execute_code."""
+    text = stringify_tool_result(value).strip()
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            inner = parsed.get("result")
+            if isinstance(inner, str):
+                try:
+                    inner_parsed = json.loads(inner)
+                    if isinstance(inner_parsed, dict):
+                        return inner_parsed
+                except json.JSONDecodeError:
+                    pass
+
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, dict):
+                inner = parsed.get("result")
+                if isinstance(inner, str):
+                    try:
+                        inner_parsed = json.loads(inner)
+                        if isinstance(inner_parsed, dict):
+                            return inner_parsed
+                    except json.JSONDecodeError:
+                        pass
+
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "all_applied": False,
+        "error": "could_not_parse_tool_result",
+        "raw": text[:2000],
+    }
+
+
+def build_verify_rename_script(expected_plan: list[dict[str, Any]]) -> str:
+    """Build a read-only Penpot Plugin API script to verify rename_layer actions."""
+    expected_json = json.dumps(expected_plan, ensure_ascii=False, default=str)
+
+    return f"""
+function toArray(value) {{
+  if (!value) return [];
+  try {{
+    return Array.from(value);
+  }} catch (err) {{
+    return [];
+  }}
+}}
+
+function walk(shape, out) {{
+  if (!shape) return;
+
+  if (shape.id) {{
+    out[String(shape.id)] = {{
+      id: String(shape.id),
+      name: shape.name ? String(shape.name) : "",
+      type: shape.type ? String(shape.type) : ""
+    }};
+  }}
+
+  var children = toArray(shape.children);
+  for (var i = 0; i < children.length; i++) {{
+    walk(children[i], out);
+  }}
+}}
+
+var expected = {expected_json};
+var shapesById = {{}};
+
+var currentPage = penpot.currentPage || null;
+var selection = toArray(penpot.selection);
+var roots = selection.length > 0
+  ? selection
+  : (currentPage ? toArray(currentPage.children) : []);
+
+for (var i = 0; i < roots.length; i++) {{
+  walk(roots[i], shapesById);
+}}
+
+var results = expected.map(function (item) {{
+  var id = String(item.id || "");
+  var expectedName = String(item.new_name || "");
+  var actual = shapesById[id] || null;
+
+  return {{
+    action: item.action || "",
+    node_ref: item.node_ref || "",
+    id: id,
+    expected_name: expectedName,
+    actual_name: actual ? actual.name : null,
+    actual_type: actual ? actual.type : null,
+    found: actual !== null,
+    applied: actual !== null && actual.name === expectedName
+  }};
+}});
+
+var appliedCount = results.filter(function (item) {{
+  return item.applied === true;
+}}).length;
+
+var allApplied = results.length > 0 && appliedCount === results.length;
+
+return JSON.stringify({{
+  all_applied: allApplied,
+  checked_count: results.length,
+  applied_count: appliedCount,
+  failed_count: results.length - appliedCount,
+  results: results
+}});
+"""
+
+
+def build_auto_fix_event(
+    *,
+    verification: dict[str, Any],
+    fix_iteration: int,
+) -> dict[str, Any]:
+    all_applied = bool(verification.get("all_applied", False))
+    error = verification.get("error")
+
+    if error:
+        status = "error"
+    elif all_applied:
+        status = "applied"
+    elif int(verification.get("applied_count", 0) or 0) > 0:
+        status = "partial"
+    else:
+        status = "not_applied"
+
+    return {
+        "type": "auto_fix_verification",
+        "status": status,
+        "verified_at": utc_now_iso(),
+        "fix_iteration": fix_iteration,
+        "checked_count": int(verification.get("checked_count", 0) or 0),
+        "applied_count": int(verification.get("applied_count", 0) or 0),
+        "failed_count": int(verification.get("failed_count", 0) or 0),
+        "results": verification.get("results", []),
+        "error": error,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -434,6 +627,11 @@ async def prepare_input(
         "skip_validation": False,
         "fix_iterations": 0,
         "max_fix_iterations": max_fix_iterations,
+        "last_auto_fix_plan": [],
+        "post_fix_validation_mode": None,
+        "auto_fix_verified": False,
+        "auto_fix_event": None,
+        "auto_fix_verification": None,
     }
 
     # Si la acción empieza validando, no mandamos todavía un mensaje al builder.
@@ -697,6 +895,9 @@ async def fix_design(
     No ejecuta tools directamente.
     Convierte validation_report.auto_fix_plan en una instrucción concreta
     y segura para que el builder aplique únicamente correcciones automáticas.
+
+    Importante: el validator sigue siendo stateless. Aquí copiamos el plan
+    propuesto a last_auto_fix_plan únicamente para verificar esta ejecución.
     """
 
     validation_report = state.get("validation_report")
@@ -712,7 +913,9 @@ async def fix_design(
             "skip_validation": True,
         }
 
-    if not has_auto_fix_plan(state):
+    auto_fix_plan = get_auto_fix_plan_from_report(validation_report)
+
+    if not auto_fix_plan:
         message = (
             "El validation_report no contiene auto_fix_plan ejecutable. "
             "No se aplicarán correcciones automáticas."
@@ -733,8 +936,118 @@ async def fix_design(
     return {
         "messages": [HumanMessage(content=fix_prompt)],
         "fix_iterations": fix_iterations + 1,
+        "last_auto_fix_plan": auto_fix_plan,
+        "post_fix_validation_mode": "structure_only",
         "response": None,
         "skip_validation": False,
+    }
+
+
+async def verify_auto_fix_plan_applied(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """
+    Verifica si el auto_fix_plan aplicado por el builder realmente quedó en Penpot.
+
+    No usa Mistral.
+    No valida si el diseño está listo para desarrollo.
+    No modifica validation_report / passed / score / status.
+    Solo agrega una bandera y un evento con timestamp para debugging/persistencia futura.
+    """
+
+    auto_fix_plan = state.get("last_auto_fix_plan", [])
+    fix_iteration = int(state.get("fix_iterations", 0) or 0)
+
+    if not isinstance(auto_fix_plan, list) or not auto_fix_plan:
+        verification = {
+            "all_applied": False,
+            "error": "missing_last_auto_fix_plan",
+            "checked_count": 0,
+            "applied_count": 0,
+            "failed_count": 0,
+            "results": [],
+        }
+        event = build_auto_fix_event(
+            verification=verification,
+            fix_iteration=fix_iteration,
+        )
+
+        return {
+            "auto_fix_verified": False,
+            "auto_fix_event": event,
+            "auto_fix_verification": verification,
+            "post_fix_validation_mode": None,
+            "response": (
+                "No se pudo verificar el auto-fix porque no hay "
+                "last_auto_fix_plan en esta ejecución."
+            ),
+        }
+
+    await get_builder_tools()
+    execute_code = _builder_tools_by_name.get("execute_code")
+
+    if execute_code is None:
+        verification = {
+            "all_applied": False,
+            "error": "execute_code_not_available",
+            "checked_count": len(auto_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(auto_fix_plan),
+            "results": [],
+        }
+        event = build_auto_fix_event(
+            verification=verification,
+            fix_iteration=fix_iteration,
+        )
+
+        return {
+            "auto_fix_verified": False,
+            "auto_fix_event": event,
+            "auto_fix_verification": verification,
+            "post_fix_validation_mode": None,
+            "response": "No se pudo verificar el auto-fix porque execute_code no está disponible.",
+        }
+
+    script = build_verify_rename_script(auto_fix_plan)
+
+    try:
+        raw_result = await execute_code.ainvoke({"code": script})
+        verification = parse_tool_json_result(raw_result)
+    except Exception as exc:
+        verification = {
+            "all_applied": False,
+            "error": repr(exc),
+            "checked_count": len(auto_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(auto_fix_plan),
+            "results": [],
+        }
+
+    event = build_auto_fix_event(
+        verification=verification,
+        fix_iteration=fix_iteration,
+    )
+    all_applied = bool(verification.get("all_applied", False))
+
+    if all_applied:
+        response = (
+            "Auto-fix verificado: todos los cambios automáticos de esta ejecución "
+            "quedaron aplicados en Penpot. No se ejecutó una segunda validación "
+            "visual; el validation_report conserva el resultado del validator."
+        )
+    else:
+        response = (
+            "Auto-fix no verificado completamente. Revisa auto_fix_event.results "
+            "para ver qué capas no coinciden."
+        )
+
+    return {
+        "auto_fix_verified": all_applied,
+        "auto_fix_event": event,
+        "auto_fix_verification": verification,
+        "post_fix_validation_mode": None,
+        "response": response,
     }
 
 
@@ -755,7 +1068,7 @@ def route_after_prepare(
 
 def should_continue_after_llm(
     state: OverallState,
-) -> Literal["tool_node", "run_validator", "__end__"]:
+) -> Literal["tool_node", "run_validator", "verify_auto_fix_plan_applied", "__end__"]:
     if state.get("skip_validation"):
         return END
 
@@ -768,6 +1081,9 @@ def should_continue_after_llm(
 
     if getattr(last_message, "tool_calls", None):
         return "tool_node"
+
+    if state.get("post_fix_validation_mode") == "structure_only":
+        return "verify_auto_fix_plan_applied"
 
     action = normalize_action(state.get("action"))
 
@@ -816,6 +1132,7 @@ agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("tool_node", tool_node)
 agent_builder.add_node("run_validator", run_validator)
 agent_builder.add_node("fix_design", fix_design)
+agent_builder.add_node("verify_auto_fix_plan_applied", verify_auto_fix_plan_applied)
 
 agent_builder.add_edge(START, "prepare_input")
 
@@ -828,7 +1145,7 @@ agent_builder.add_conditional_edges(
 agent_builder.add_conditional_edges(
     "llm_call",
     should_continue_after_llm,
-    ["tool_node", "run_validator", END],
+    ["tool_node", "run_validator", "verify_auto_fix_plan_applied", END],
 )
 
 agent_builder.add_edge("tool_node", "llm_call")
@@ -840,5 +1157,6 @@ agent_builder.add_conditional_edges(
 )
 
 agent_builder.add_edge("fix_design", "llm_call")
+agent_builder.add_edge("verify_auto_fix_plan_applied", END)
 
 graph = agent_builder.compile(name="Penpot Design Workflow")
