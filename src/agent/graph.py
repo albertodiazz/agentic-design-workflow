@@ -25,6 +25,8 @@ from agent.utils.llm_control import (
     usage_updates_from_metered_result,
 )
 
+from agent.utils.fixer_prompt import build_fix_design_prompt
+
 
 # ---------------------------------------------------------------------
 # Paths
@@ -114,8 +116,11 @@ Cuando crees interfaces gráficas:
 - Todo input debe tener label, container y placeholder.
 
 Cuando corrijas un diseño a partir de un reporte de validación:
-- Aplica únicamente las correcciones indicadas por el reporte.
-- Prioriza problemas critical y high.
+- Si existe AUTO_FIX_PLAN o auto_fix_plan, aplica únicamente esas acciones.
+- Por ahora, las correcciones automáticas seguras son de tipo rename_layer.
+- Para rename_layer, renombra solo la capa indicada por id/node_ref y usa exactamente el new_name indicado.
+- No apliques manual_fixes automáticamente. Trátalos solo como notas para desarrollo/diseño.
+- No cambies posición, tamaño, color, texto visible, layout, componentes ni tokens salvo que el auto_fix_plan lo indique explícitamente.
 - Mantén la intención visual original.
 - No borres elementos existentes salvo que el reporte lo exija explícitamente.
 - Usa execute_code solo cuando necesites modificar Penpot.
@@ -374,6 +379,30 @@ def content_to_text(content: Any) -> str:
 
 def validation_passed(state: OverallState) -> bool:
     return bool(state.get("passed", False))
+
+
+def has_auto_fix_plan(state: OverallState) -> bool:
+    report = state.get("validation_report")
+
+    if not isinstance(report, dict):
+        return False
+
+    plan = report.get("auto_fix_plan", [])
+
+    if not isinstance(plan, list):
+        return False
+
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("action") != "rename_layer":
+            continue
+
+        if item.get("id") and item.get("new_name"):
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------
@@ -666,11 +695,13 @@ async def fix_design(
     Fixer node.
 
     No ejecuta tools directamente.
-    Convierte validation_report en una instrucción concreta para el builder.
+    Convierte validation_report.auto_fix_plan en una instrucción concreta
+    y segura para que el builder aplique únicamente correcciones automáticas.
     """
 
     validation_report = state.get("validation_report")
     fix_iterations = int(state.get("fix_iterations", 0) or 0)
+    max_fix_iterations = int(state.get("max_fix_iterations", 1) or 1)
 
     if not validation_report:
         error_message = "No hay validation_report disponible para corregir."
@@ -681,26 +712,29 @@ async def fix_design(
             "skip_validation": True,
         }
 
-    fix_prompt = (
-        "Corrige el diseño actual de Penpot usando el siguiente reporte de validación.\n\n"
-        "Reglas obligatorias:\n"
-        "- Corrige únicamente problemas reportados.\n"
-        "- Prioriza issues con severity critical y high.\n"
-        "- Si hay problemas medium simples, corrígelos también cuando no alteren la intención visual.\n"
-        "- No borres elementos existentes salvo que el reporte lo indique explícitamente.\n"
-        "- Mantén la intención visual original del diseño.\n"
-        "- Mejora nombres de capas, estructura, tokens, layout y componentes.\n"
-        "- Usa execute_code solo cuando sea necesario modificar Penpot.\n"
-        "- No digas que corregiste algo si no ejecutaste correctamente una herramienta.\n"
-        "- Al terminar, responde de forma breve qué cambios aplicaste.\n\n"
-        "VALIDATION_REPORT:\n"
-        f"{json.dumps(validation_report, ensure_ascii=False, default=str)}"
+    if not has_auto_fix_plan(state):
+        message = (
+            "El validation_report no contiene auto_fix_plan ejecutable. "
+            "No se aplicarán correcciones automáticas."
+        )
+
+        return {
+            "messages": [AIMessage(content=message)],
+            "response": message,
+            "skip_validation": True,
+        }
+
+    fix_prompt = build_fix_design_prompt(
+        validation_report,
+        fix_iteration=fix_iterations + 1,
+        max_fix_iterations=max_fix_iterations,
     )
 
     return {
         "messages": [HumanMessage(content=fix_prompt)],
         "fix_iterations": fix_iterations + 1,
         "response": None,
+        "skip_validation": False,
     }
 
 
@@ -752,6 +786,9 @@ def route_after_validator(
         return END
 
     if validation_passed(state):
+        return END
+
+    if not has_auto_fix_plan(state):
         return END
 
     fix_iterations = int(state.get("fix_iterations", 0) or 0)

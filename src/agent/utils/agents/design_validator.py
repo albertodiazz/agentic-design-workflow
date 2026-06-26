@@ -198,6 +198,18 @@ Devuelve exactamente esta estructura JSON:
   "required_fixes": [],
   "suggested_structure": "",
   "developer_notes": [],
+  "manual_fixes": [],
+  "auto_fix_plan": [
+    {
+      "action": "rename_layer",
+      "node_ref": "",
+      "id": "",
+      "current_name": "",
+      "new_name": "",
+      "reason": "",
+      "safety": "safe_auto_fix"
+    }
+  ],
   "can_be_sent_to_development": false
 }
 """.strip()
@@ -537,6 +549,8 @@ def make_error_report(
         "required_fixes": [recommendation],
         "suggested_structure": "",
         "developer_notes": [],
+        "manual_fixes": [],
+        "auto_fix_plan": [],
         "can_be_sent_to_development": False,
     }
 
@@ -1290,6 +1304,229 @@ def normalize_report_layer_references(
 
     return report
 
+
+def is_generic_layer_name(name: Any) -> bool:
+    """Return True when a Penpot layer name is too generic for handoff."""
+    value = str(name or "").strip().lower()
+    if not value:
+        return True
+
+    generic_names = {
+        "rectangle",
+        "rect",
+        "text",
+        "group",
+        "shape",
+        "path",
+        "board",
+        "frame",
+        "ellipse",
+        "image",
+    }
+
+    if value in generic_names:
+        return True
+
+    for generic_name in generic_names:
+        if value.startswith(generic_name + " "):
+            suffix = value.removeprefix(generic_name + " ").strip()
+            if suffix.isdigit():
+                return True
+
+        if value.startswith(generic_name + "-"):
+            suffix = value.removeprefix(generic_name + "-").strip()
+            if suffix.isdigit():
+                return True
+
+    return False
+
+
+def pascal_case(value: str) -> str:
+    """Small dependency-free PascalCase helper for generated layer names."""
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in value)
+    parts = [part for part in cleaned.strip().split() if part]
+    if not parts:
+        return "Layer"
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def suggest_semantic_layer_name(
+    *,
+    visual_region: str,
+    inferred_role: str,
+    layer: dict[str, Any],
+) -> str | None:
+    """Generate a conservative rename suggestion from visual mapping."""
+    region = str(visual_region or "").strip().lower()
+    role = str(inferred_role or "").strip().lower()
+    layer_type = str(layer.get("type") or "").strip().lower()
+    text_value = str(layer.get("text") or "").strip().lower()
+    combined = f"{region} {role} {text_value}"
+
+    # Specific UI roles first.
+    if "email" in combined:
+        if "background" in combined or "input" in combined or "rectangle" in layer_type:
+            return "EmailInputBackground"
+        return "EmailInputLabel"
+
+    if "password" in combined or "contraseña" in combined:
+        if "background" in combined or "input" in combined or "rectangle" in layer_type:
+            return "PasswordInputBackground"
+        return "PasswordInputLabel"
+
+    if "button" in combined or "login" in combined or "iniciar" in combined:
+        if "text" in role or "text" in layer_type:
+            return "LoginButtonText"
+        return "LoginButtonBackground"
+
+    if "title" in combined or "heading" in combined:
+        return "LoginTitleText"
+
+    if "container" in combined or "background" in combined:
+        return "LoginCardBackground"
+
+    # Generic fallback based on model role + layer type.
+    if role:
+        base = pascal_case(role)
+        if "text" in layer_type and not base.endswith("Text"):
+            base += "Text"
+        if "rectangle" in layer_type and not base.endswith(("Background", "Container")):
+            base += "Background"
+        return base
+
+    return None
+
+
+def build_auto_fix_plan(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Build a deterministic, safe auto-fix plan from the normalized visual map.
+
+    First phase is intentionally conservative: only rename generic layers.
+    No layout, color, text, component, or accessibility mutation is planned here.
+    """
+    visual_map = report.get("visual_structure_map", [])
+    if not isinstance(visual_map, list):
+        return []
+
+    plan: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    used_new_names: set[str] = set()
+
+    for item in visual_map:
+        if not isinstance(item, dict):
+            continue
+
+        layer = item.get("matched_layer")
+        if not isinstance(layer, dict):
+            continue
+
+        node_ref = str(layer.get("node_ref") or "").strip()
+        layer_id = str(layer.get("id") or "").strip()
+        current_name = str(layer.get("name") or "").strip()
+
+        if not node_ref or not layer_id:
+            continue
+
+        if layer_id in used_ids:
+            continue
+
+        if not is_generic_layer_name(current_name):
+            continue
+
+        suggested_name = suggest_semantic_layer_name(
+            visual_region=str(item.get("visual_region") or ""),
+            inferred_role=str(item.get("inferred_role") or ""),
+            layer=layer,
+        )
+
+        if not suggested_name or suggested_name == current_name:
+            continue
+
+        base_name = suggested_name
+        counter = 2
+        while suggested_name in used_new_names:
+            suggested_name = f"{base_name}{counter}"
+            counter += 1
+
+        used_ids.add(layer_id)
+        used_new_names.add(suggested_name)
+
+        plan.append(
+            {
+                "action": "rename_layer",
+                "node_ref": node_ref,
+                "id": layer_id,
+                "current_name": current_name,
+                "new_name": suggested_name,
+                "type": layer.get("type", ""),
+                "path": layer.get("path", ""),
+                "bbox": layer.get("bbox"),
+                "reason": "Layer name is generic and does not describe its visual/frontend role.",
+                "safety": "safe_auto_fix",
+            }
+        )
+
+    return plan
+
+
+def build_manual_fixes(report: dict[str, Any]) -> list[str]:
+    """Extract non-safe or non-automatic fixes as manual handoff notes."""
+    issues = report.get("issues", [])
+    if not isinstance(issues, list):
+        return []
+
+    manual_categories = {
+        "accessibility",
+        "componentization",
+        "design_system",
+        "design_tokens",
+        "layout",
+        "frontend_handoff",
+        "interaction_states",
+    }
+
+    manual_fixes: list[str] = []
+    seen: set[str] = set()
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+
+        category = str(issue.get("category") or "").strip().lower()
+        severity = str(issue.get("severity") or "").strip().lower()
+        recommendation = str(issue.get("recommendation") or "").strip()
+
+        if not recommendation:
+            continue
+
+        if category in manual_categories or severity in {"critical", "high"} and category not in {"naming", "semantic_naming", "layer_naming"}:
+            if recommendation not in seen:
+                manual_fixes.append(recommendation)
+                seen.add(recommendation)
+
+    return manual_fixes
+
+
+def attach_fix_plans(report: dict[str, Any]) -> dict[str, Any]:
+    """Attach deterministic auto/manual fix plans to the validator report."""
+    auto_fix_plan = build_auto_fix_plan(report)
+    manual_fixes = build_manual_fixes(report)
+
+    report["auto_fix_plan"] = auto_fix_plan
+    report["manual_fixes"] = manual_fixes
+
+    if auto_fix_plan:
+        developer_notes = report.get("developer_notes", [])
+        if not isinstance(developer_notes, list):
+            developer_notes = [str(developer_notes)]
+        developer_notes.append(
+            "auto_fix_plan generated deterministically: first phase only renames generic layers."
+        )
+        report["developer_notes"] = developer_notes
+
+    return report
+
+
 def make_compact_design_context(design_context: dict[str, Any]) -> dict[str, Any]:
     """Return only the information Mistral needs for visual-layer mapping."""
     return {
@@ -1510,6 +1747,7 @@ async def validator_visual_call(
         if isinstance(report, dict):
             report = attach_design_context_to_report(report, design_context)
             report = normalize_report_layer_references(report, design_context)
+            report = attach_fix_plans(report)
 
         return {
             **extract_output_from_report(report),
