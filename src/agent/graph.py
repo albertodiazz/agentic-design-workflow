@@ -30,7 +30,11 @@ from agent.utils.resource_loader import (
     read_skill,
 )
 
-from agent.utils.fixer_prompt import build_fix_design_prompt
+from agent.utils.fixer_prompt import (
+    canvas_auto_fix_enabled,
+    canvas_confidence_threshold,
+    extract_known_canvas_targets,
+)
 
 
 # ---------------------------------------------------------------------
@@ -247,6 +251,9 @@ class OverallState(MessagesState, total=False):
     # Debug/event state for post-fix verification.
     # This is intentionally separate from validation_report / passed / score / status.
     last_auto_fix_plan: NotRequired[list[dict[str, Any]]]
+    last_canvas_fix_targets: NotRequired[list[dict[str, Any]]]
+    last_canvas_fix_plan: NotRequired[list[dict[str, Any]]]
+    canvas_auto_fix_result: NotRequired[dict[str, Any]]
     post_fix_validation_mode: NotRequired[str | None]
     auto_fix_verified: NotRequired[bool]
     auto_fix_event: NotRequired[dict[str, Any] | None]
@@ -415,51 +422,114 @@ def has_auto_fix_plan(state: OverallState) -> bool:
     return bool(get_auto_fix_plan_from_report(state.get("validation_report")))
 
 
+def has_canvas_auto_fix_candidates(state: OverallState) -> bool:
+    """Return True when canvas auto-fix may run without a rename phase.
+
+    This is allowed only when the env flag is enabled and the validator has
+    already mapped known targets with sufficient confidence.
+    """
+    validation_report = state.get("validation_report")
+    if not canvas_auto_fix_enabled() or not isinstance(validation_report, dict):
+        return False
+
+    return bool(extract_known_canvas_targets(validation_report))
+
+
+def has_executable_fix(state: OverallState) -> bool:
+    """Return True when validate_and_fix has something executable to do.
+
+    Rename still has priority. If no rename_layer plan exists, canvas auto-fix
+    can run as a rename_phase=no_op only when the canvas flag is enabled and
+    safe known targets exist.
+    """
+    return has_auto_fix_plan(state) or has_canvas_auto_fix_candidates(state)
+
+
 def parse_tool_json_result(value: Any) -> dict[str, Any]:
-    """Parse JSON-ish output returned by Penpot execute_code."""
-    text = stringify_tool_result(value).strip()
+    """Parse JSON-ish output returned by Penpot execute_code.
 
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            inner = parsed.get("result")
-            if isinstance(inner, str):
-                try:
-                    inner_parsed = json.loads(inner)
-                    if isinstance(inner_parsed, dict):
-                        return inner_parsed
-                except json.JSONDecodeError:
-                    pass
+    MCP responses often wrap the real JSON inside {"text": "..."} and that
+    inner JSON may wrap the plugin result again inside {"result": "..."}.
+    This function recursively unwraps those envelopes before building events.
+    """
 
-            return parsed
-    except json.JSONDecodeError:
-        pass
+    def parse_text(text: str) -> Any:
+        stripped = text.strip()
 
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start >= 0 and end > start:
         try:
-            parsed = json.loads(text[start : end + 1])
-            if isinstance(parsed, dict):
-                inner = parsed.get("result")
-                if isinstance(inner, str):
-                    try:
-                        inner_parsed = json.loads(inner)
-                        if isinstance(inner_parsed, dict):
-                            return inner_parsed
-                    except json.JSONDecodeError:
-                        pass
-
-                return parsed
+            return json.loads(stripped)
         except json.JSONDecodeError:
             pass
+
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+
+        if start >= 0 and end > start:
+            try:
+                return json.loads(stripped[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def unwrap(obj: Any, depth: int = 0) -> Any:
+        if depth > 8:
+            return obj
+
+        if isinstance(obj, str):
+            parsed = parse_text(obj)
+            if parsed is None:
+                return None
+            return unwrap(parsed, depth + 1)
+
+        if isinstance(obj, list):
+            # MCP frequently returns a list like:
+            # [{"type": "text", "text": "{\"result\": \"{...}\"}"}].
+            # The useful JSON may be nested inside any item, so inspect all items.
+            for item in obj:
+                parsed_item = unwrap(item, depth + 1)
+                if isinstance(parsed_item, dict):
+                    return parsed_item
+            return None
+
+        if isinstance(obj, dict):
+            # Prefer known MCP/text envelopes over returning the wrapper itself.
+            for key in ("result", "text", "content"):
+                inner = obj.get(key)
+                if isinstance(inner, (str, dict, list)):
+                    parsed_inner = unwrap(inner, depth + 1)
+                    if isinstance(parsed_inner, dict):
+                        return parsed_inner
+
+            return obj
+
+        return None
+
+    parsed = unwrap(value)
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    text = stringify_tool_result(value).strip()
+    parsed = unwrap(text)
+
+    if isinstance(parsed, dict):
+        return parsed
 
     return {
         "all_applied": False,
         "error": "could_not_parse_tool_result",
         "raw": text[:2000],
     }
+
+
+def build_apply_rename_script(rename_plan: list[dict[str, Any]]) -> str:
+    """Render the Penpot Plugin API script that applies rename_layer actions."""
+    plan_json = json.dumps(rename_plan, ensure_ascii=False, default=str)
+    return load_js("penpot_apply_rename_plan.js").replace(
+        "__RENAME_PLAN_JSON__",
+        plan_json,
+    )
 
 
 def build_verify_rename_script(expected_plan: list[dict[str, Any]]) -> str:
@@ -469,6 +539,372 @@ def build_verify_rename_script(expected_plan: list[dict[str, Any]]) -> str:
         "__EXPECTED_PLAN_JSON__",
         expected_json,
     )
+
+
+def build_apply_canvas_fix_script(canvas_plan: list[dict[str, Any]]) -> str:
+    """Render the Penpot Plugin API script that applies deterministic canvas edits."""
+    plan_json = json.dumps(canvas_plan, ensure_ascii=False, default=str)
+    return load_js("penpot_apply_canvas_fix_plan.js").replace(
+        "__CANVAS_FIX_PLAN_JSON__",
+        plan_json,
+    )
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bbox(item: dict[str, Any]) -> dict[str, float]:
+    raw = item.get("bbox") if isinstance(item, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "x": _num(raw.get("x")),
+        "y": _num(raw.get("y")),
+        "width": _num(raw.get("width")),
+        "height": _num(raw.get("height")),
+    }
+
+
+def _issue_refs(validation_report: Any, categories: set[str] | None = None) -> set[str]:
+    if not isinstance(validation_report, dict):
+        return set()
+
+    refs: set[str] = set()
+    for issue in validation_report.get("issues", []) or []:
+        if not isinstance(issue, dict):
+            continue
+        category = str(issue.get("category") or "")
+        if categories is not None and category not in categories:
+            continue
+        for layer in issue.get("affected_layers", []) or []:
+            if isinstance(layer, dict) and layer.get("node_ref"):
+                refs.add(str(layer["node_ref"]))
+    return refs
+
+
+def _role(item: dict[str, Any]) -> str:
+    return str(item.get("inferred_role") or item.get("role") or "").lower()
+
+
+def _region(item: dict[str, Any]) -> str:
+    return str(item.get("visual_region") or "").lower()
+
+
+def _target_name(item: dict[str, Any]) -> str:
+    return str(item.get("name") or "")
+
+
+def _is_text(item: dict[str, Any]) -> bool:
+    return str(item.get("type") or "").lower() == "text"
+
+
+def _canonical_number(value: float) -> int:
+    return int(round(value))
+
+
+def _add_plan_action(
+    plan: list[dict[str, Any]],
+    seen: set[tuple[str, str]],
+    action: dict[str, Any],
+) -> None:
+    node_ref = str(action.get("node_ref") or "")
+    action_type = str(action.get("action") or "")
+    key = (node_ref, action_type)
+    if not node_ref or not action_type or key in seen:
+        return
+    seen.add(key)
+    plan.append(action)
+
+
+def build_deterministic_canvas_fix_plan(
+    validation_report: Any,
+    known_targets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a stronger deterministic canvas_fix_plan from the report.
+
+    This planner is still conservative: it only targets known_targets mapped by the
+    validator. Unlike the earlier version, it applies a clear login/form layout
+    rhythm, centers paired text, and adds concrete contrast/focus affordance edits.
+    """
+    if not isinstance(validation_report, dict) or not known_targets:
+        return []
+
+    by_ref = {
+        str(item.get("node_ref")): item
+        for item in known_targets
+        if isinstance(item, dict) and item.get("node_ref") and item.get("id")
+    }
+    if not by_ref:
+        return []
+
+    all_issue_refs = _issue_refs(validation_report)
+    layout_refs = _issue_refs(validation_report, {"layout_spacing", "layout"})
+    text_refs = _issue_refs(validation_report, {"text_legibility", "typography"})
+    accessibility_refs = _issue_refs(validation_report, {"accessibility"})
+    handoff_refs = _issue_refs(validation_report, {"frontend_handoff"})
+
+    plan: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_position(target: dict[str, Any], x: float, y: float, reason: str) -> None:
+        bbox = _bbox(target)
+        current_x = _canonical_number(bbox["x"])
+        current_y = _canonical_number(bbox["y"])
+        new_x = _canonical_number(x)
+        new_y = _canonical_number(y)
+        if current_x == new_x and current_y == new_y:
+            return
+        _add_plan_action(
+            plan,
+            seen,
+            {
+                "action": "set_position",
+                "node_ref": target.get("node_ref"),
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "type": target.get("type"),
+                "current": {"x": current_x, "y": current_y},
+                "target": {"x": new_x, "y": new_y},
+                "reason": reason,
+                "safety": "safe_canvas_fix_known_target",
+            },
+        )
+
+    def add_font_size(target: dict[str, Any], min_size: int, reason: str) -> None:
+        if not _is_text(target):
+            return
+        _add_plan_action(
+            plan,
+            seen,
+            {
+                "action": "set_min_font_size",
+                "node_ref": target.get("node_ref"),
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "type": target.get("type"),
+                "min_font_size": min_size,
+                "reason": reason,
+                "safety": "safe_canvas_fix_known_target",
+            },
+        )
+
+    def add_text_color(target: dict[str, Any], color: str, reason: str) -> None:
+        if not _is_text(target):
+            return
+        _add_plan_action(
+            plan,
+            seen,
+            {
+                "action": "set_text_color",
+                "node_ref": target.get("node_ref"),
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "type": target.get("type"),
+                "text_color": color,
+                "reason": reason,
+                "safety": "safe_canvas_fix_known_target",
+            },
+        )
+
+    def add_fill_color(target: dict[str, Any], color: str, reason: str) -> None:
+        if str(target.get("type") or "").lower() == "text":
+            return
+        _add_plan_action(
+            plan,
+            seen,
+            {
+                "action": "set_fill_color",
+                "node_ref": target.get("node_ref"),
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "type": target.get("type"),
+                "fill_color": color,
+                "reason": reason,
+                "safety": "safe_canvas_fix_known_target",
+            },
+        )
+
+    def add_focus_border(target: dict[str, Any], color: str, width: int, reason: str) -> None:
+        if str(target.get("type") or "").lower() == "text":
+            return
+        _add_plan_action(
+            plan,
+            seen,
+            {
+                "action": "set_stroke",
+                "node_ref": target.get("node_ref"),
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "type": target.get("type"),
+                "stroke_color": color,
+                "stroke_width": width,
+                "reason": reason,
+                "safety": "safe_canvas_fix_known_target",
+            },
+        )
+
+    targets = list(by_ref.values())
+
+    card = next(
+        (
+            t for t in targets
+            if "card" in _role(t) or "card" in _region(t) or "container" in _role(t)
+        ),
+        None,
+    )
+    title = next(
+        (
+            t for t in targets
+            if "heading" in _role(t) or "title" in _region(t) or "title" in _target_name(t).lower()
+        ),
+        None,
+    )
+    input_bgs = sorted(
+        [
+            t for t in targets
+            if (
+                "input" in _role(t)
+                or "input_background" in _region(t)
+                or "inputbackground" in _target_name(t).lower()
+            )
+            and str(t.get("type") or "").lower() != "text"
+        ],
+        key=lambda t: _bbox(t)["y"],
+    )
+    button_bg = next(
+        (
+            t for t in targets
+            if ("button" in _role(t) or "button_background" in _region(t))
+            and str(t.get("type") or "").lower() != "text"
+        ),
+        None,
+    )
+    button_text = next(
+        (t for t in targets if "button_text" in _role(t) or "button_text" in _region(t)),
+        None,
+    )
+
+    # Strong layout rhythm for a common login card.
+    if layout_refs:
+        cb = _bbox(card) if card else None
+        card_x = cb["x"] if cb else min((_bbox(t)["x"] for t in targets), default=0)
+        card_y = cb["y"] if cb else min((_bbox(t)["y"] for t in targets), default=0)
+        card_w = cb["width"] if cb and cb["width"] else 0
+
+        form_width = max(
+            (_bbox(t)["width"] for t in input_bgs + ([button_bg] if button_bg else [])),
+            default=0,
+        )
+        target_x = (
+            card_x + max((card_w - form_width) / 2, 0)
+            if card_w and form_width
+            else min((_bbox(t)["x"] for t in input_bgs), default=0)
+        )
+
+        gap = 24
+        if title:
+            tb = _bbox(title)
+            title_y = card_y + 40 if card_y else tb["y"]
+            title_x = card_x + max((card_w - tb["width"]) / 2, 0) if card_w and tb["width"] else tb["x"]
+            if str(title.get("node_ref")) in layout_refs or str(title.get("node_ref")) in all_issue_refs:
+                add_position(title, title_x, title_y, "Apply 8px-grid title placement inside the card.")
+            first_y = title_y + (tb["height"] or 28) + gap
+        else:
+            first_y = min((_bbox(t)["y"] for t in input_bgs), default=card_y + 96)
+
+        y = first_y
+        for input_bg in input_bgs:
+            ref = str(input_bg.get("node_ref"))
+            ib = _bbox(input_bg)
+            if ref in layout_refs or ref in all_issue_refs:
+                add_position(input_bg, target_x, y, "Apply consistent 24px vertical rhythm to form fields.")
+
+            prefix = _region(input_bg).replace("_input_background", "")
+            paired_label = next(
+                (
+                    t for t in targets
+                    if _is_text(t)
+                    and (
+                        (prefix and prefix in _region(t))
+                        or (prefix and prefix in _target_name(t).lower())
+                    )
+                ),
+                None,
+            )
+            if paired_label:
+                lb = _bbox(paired_label)
+                label_x = target_x + 12
+                label_y = y + max(((ib["height"] or 40) - (lb["height"] or 16)) / 2, 0)
+                add_position(
+                    paired_label,
+                    label_x,
+                    label_y,
+                    "Center label vertically inside its input background.",
+                )
+            y += (ib["height"] or 40) + gap
+
+        if button_bg:
+            bb = _bbox(button_bg)
+            button_y = y
+            if str(button_bg.get("node_ref")) in layout_refs or str(button_bg.get("node_ref")) in all_issue_refs:
+                add_position(button_bg, target_x, button_y, "Apply consistent 24px spacing before the primary button.")
+            if button_text:
+                tb = _bbox(button_text)
+                text_x = target_x + max(((bb["width"] or form_width) - (tb["width"] or 0)) / 2, 0)
+                text_y = button_y + max(((bb["height"] or 45) - (tb["height"] or 20)) / 2, 0)
+                add_position(
+                    button_text,
+                    text_x,
+                    text_y,
+                    "Center button text inside the button background.",
+                )
+
+    # Typography and legibility.
+    for target in targets:
+        ref = str(target.get("node_ref"))
+        role = _role(target)
+        region = _region(target)
+        name = _target_name(target).lower()
+        if not _is_text(target):
+            continue
+
+        if "heading" in role or "title" in region or "title" in name:
+            add_font_size(target, 24, "Use a minimum 24px heading size for hierarchy.")
+            add_text_color(target, "#111827", "Use dark heading text for stronger contrast.")
+        elif "button_text" in role or "button" in region:
+            add_font_size(target, 16, "Use a minimum 16px button text size.")
+            add_text_color(target, "#FFFFFF", "Use white button text over primary button fill.")
+        elif ref in text_refs or ref in accessibility_refs or "label" in role or "label" in region:
+            add_font_size(target, 14, "Use a minimum 14px label size.")
+            add_text_color(target, "#111827", "Use dark label text for WCAG-oriented contrast.")
+
+    # Accessibility and handoff affordances.
+    for target in targets:
+        ref = str(target.get("node_ref"))
+        role = _role(target)
+        region = _region(target)
+        name = _target_name(target).lower()
+        target_kind = " ".join([role, region, name])
+        is_input = "input" in target_kind and not _is_text(target)
+        is_button = "button" in target_kind and not _is_text(target)
+        is_card = "card" in target_kind and not _is_text(target)
+
+        if is_input and (ref in accessibility_refs or accessibility_refs or ref in handoff_refs):
+            add_fill_color(target, "#FFFFFF", "Use white input fill for readable text contrast.")
+            add_focus_border(target, "#94A3B8", 1, "Add visible input border/focus affordance.")
+        elif is_button and (ref in accessibility_refs or ref in handoff_refs or handoff_refs):
+            add_fill_color(target, "#2563EB", "Use primary button fill for clear call-to-action contrast.")
+            add_focus_border(target, "#1D4ED8", 1, "Add visible button border/focus affordance.")
+        elif is_card and ref in handoff_refs:
+            add_fill_color(target, "#F8FAFC", "Use a neutral card fill to clarify the login surface.")
+
+    return plan
 
 def build_auto_fix_event(
     *,
@@ -530,6 +966,9 @@ async def prepare_input(
         "fix_iterations": 0,
         "max_fix_iterations": max_fix_iterations,
         "last_auto_fix_plan": [],
+        "last_canvas_fix_targets": [],
+        "last_canvas_fix_plan": [],
+        "canvas_auto_fix_result": None,
         "post_fix_validation_mode": None,
         "auto_fix_verified": False,
         "auto_fix_event": None,
@@ -803,32 +1242,176 @@ async def fix_design(
         }
 
     auto_fix_plan = get_auto_fix_plan_from_report(validation_report)
+    is_canvas_mode = canvas_auto_fix_enabled()
 
     if not auto_fix_plan:
-        message = (
-            "El validation_report no contiene auto_fix_plan ejecutable. "
-            "No se aplicarán correcciones automáticas."
+        known_targets = (
+            extract_known_canvas_targets(validation_report)
+            if is_canvas_mode and isinstance(validation_report, dict)
+            else []
+        )
+
+        if not is_canvas_mode:
+            message = (
+                "El validation_report no contiene auto_fix_plan ejecutable y "
+                "PENPOT_ENABLE_CANVAS_AUTO_FIX no está activo."
+            )
+
+            return {
+                "messages": [AIMessage(content=message)],
+                "response": message,
+                "skip_validation": True,
+            }
+
+        if not known_targets:
+            message = (
+                "Canvas auto-fix omitido: no hay rename_layer pendiente ni "
+                f"known_targets con confidence >= {canvas_confidence_threshold():.2f}."
+            )
+
+            return {
+                "messages": [AIMessage(content=message)],
+                "response": message,
+                "skip_validation": True,
+            }
+
+        next_iteration = fix_iterations + 1
+        rename_verification = {
+            "all_applied": True,
+            "rename_status": "not_needed",
+            "checked_count": 0,
+            "applied_count": 0,
+            "failed_count": 0,
+            "results": [],
+            "reason": (
+                "No rename_layer auto_fix_plan was generated; the canvas phase "
+                "is allowed as rename_phase=no_op because safe known targets exist."
+            ),
+        }
+        rename_event = build_auto_fix_event(
+            verification=rename_verification,
+            fix_iteration=next_iteration,
+        )
+        rename_event["status"] = "not_needed"
+        rename_event["rename_status"] = "not_needed"
+
+        canvas_fix_plan = build_deterministic_canvas_fix_plan(validation_report, known_targets)
+
+        if not canvas_fix_plan:
+            message = (
+                "Canvas auto-fix omitido: hay known_targets, pero no se pudo "
+                "generar canvas_fix_plan determinístico ejecutable."
+            )
+            return {
+                "messages": [AIMessage(content=message)],
+                "response": message,
+                "skip_validation": True,
+            }
+
+        return {
+            "fix_iterations": next_iteration,
+            "last_auto_fix_plan": [],
+            "last_canvas_fix_targets": known_targets,
+            "last_canvas_fix_plan": canvas_fix_plan,
+            "post_fix_validation_mode": "canvas_fix_pending",
+            "auto_fix_verified": True,
+            "auto_fix_event": rename_event,
+            "auto_fix_verification": rename_verification,
+            "response": None,
+            "skip_validation": False,
+        }
+
+    post_fix_mode = "structure_then_canvas" if is_canvas_mode else "structure_only"
+
+    return {
+        "fix_iterations": fix_iterations + 1,
+        "last_auto_fix_plan": auto_fix_plan,
+        "last_canvas_fix_targets": [],
+        "post_fix_validation_mode": post_fix_mode,
+        "response": None,
+        "skip_validation": False,
+    }
+
+
+async def apply_auto_fix_plan_deterministic(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """Apply rename_layer actions directly with Penpot execute_code.
+
+    rename_layer is deterministic, safe and verifiable by id, so it should not
+    depend on a builder LLM tool-calling turn. Broader canvas edits still go
+    through the builder only after this phase is verified.
+    """
+    auto_fix_plan = state.get("last_auto_fix_plan", [])
+    fix_iteration = int(state.get("fix_iterations", 0) or 0)
+
+    if not isinstance(auto_fix_plan, list) or not auto_fix_plan:
+        return {
+            "post_fix_validation_mode": None,
+            "response": "No hay last_auto_fix_plan para aplicar determinísticamente.",
+        }
+
+    await get_builder_tools()
+    execute_code = _builder_tools_by_name.get("execute_code")
+
+    if execute_code is None:
+        verification = {
+            "all_applied": False,
+            "error": "execute_code_not_available",
+            "checked_count": len(auto_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(auto_fix_plan),
+            "results": [],
+        }
+        event = build_auto_fix_event(
+            verification=verification,
+            fix_iteration=fix_iteration,
         )
 
         return {
-            "messages": [AIMessage(content=message)],
-            "response": message,
-            "skip_validation": True,
+            "auto_fix_verified": False,
+            "auto_fix_event": event,
+            "auto_fix_verification": verification,
+            "post_fix_validation_mode": None,
+            "response": "No se pudo aplicar rename_layer porque execute_code no está disponible.",
         }
 
-    fix_prompt = build_fix_design_prompt(
-        validation_report,
-        fix_iteration=fix_iterations + 1,
-        max_fix_iterations=max_fix_iterations,
-    )
+    script = build_apply_rename_script(auto_fix_plan)
+
+    try:
+        raw_result = await execute_code.ainvoke({"code": script})
+        application = parse_tool_json_result(raw_result)
+    except Exception as exc:
+        application = {
+            "all_applied": False,
+            "error": repr(exc),
+            "checked_count": len(auto_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(auto_fix_plan),
+            "results": [],
+        }
+
+    if application.get("error"):
+        event = build_auto_fix_event(
+            verification=application,
+            fix_iteration=fix_iteration,
+        )
+
+        return {
+            "auto_fix_verified": False,
+            "auto_fix_event": event,
+            "auto_fix_verification": application,
+            "post_fix_validation_mode": None,
+            "response": "No se pudo aplicar rename_layer determinísticamente.",
+        }
 
     return {
-        "messages": [HumanMessage(content=fix_prompt)],
-        "fix_iterations": fix_iterations + 1,
-        "last_auto_fix_plan": auto_fix_plan,
-        "post_fix_validation_mode": "structure_only",
+        "auto_fix_verification": {
+            "type": "rename_apply_result",
+            **application,
+        },
         "response": None,
-        "skip_validation": False,
     }
 
 
@@ -931,12 +1514,188 @@ async def verify_auto_fix_plan_applied(
             "para ver qué capas no coinciden."
         )
 
+    should_try_canvas = (
+        all_applied
+        and canvas_auto_fix_enabled()
+        and state.get("post_fix_validation_mode") == "structure_then_canvas"
+        and isinstance(state.get("validation_report"), dict)
+    )
+
+    if should_try_canvas:
+        known_targets = extract_known_canvas_targets(state.get("validation_report"))
+
+        if known_targets:
+            canvas_fix_plan = build_deterministic_canvas_fix_plan(
+                state["validation_report"],
+                known_targets,
+            )
+
+            if canvas_fix_plan:
+                return {
+                    "auto_fix_verified": all_applied,
+                    "auto_fix_event": event,
+                    "auto_fix_verification": verification,
+                    "last_canvas_fix_targets": known_targets,
+                    "last_canvas_fix_plan": canvas_fix_plan,
+                    "post_fix_validation_mode": "canvas_fix_pending",
+                    "response": None,
+                }
+
+            response += " Canvas auto-fix omitido: no se generó canvas_fix_plan determinístico."
+
+        response += (
+            f" Canvas auto-fix omitido: no hay known_targets con "
+            f"confidence >= {canvas_confidence_threshold():.2f}."
+        )
+
     return {
         "auto_fix_verified": all_applied,
         "auto_fix_event": event,
         "auto_fix_verification": verification,
         "post_fix_validation_mode": None,
         "response": response,
+    }
+
+
+
+async def apply_canvas_fix_plan_deterministic(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """Apply explicit canvas_fix_plan actions through Penpot execute_code.
+
+    This replaces broad, generic builder instructions with concrete operations
+    such as set_position, set_min_font_size and set_stroke. It still does not
+    claim visual success; a fresh validate_only run is required for scoring.
+    """
+    canvas_fix_plan = state.get("last_canvas_fix_plan", [])
+
+    if not isinstance(canvas_fix_plan, list) or not canvas_fix_plan:
+        return {
+            "canvas_auto_fix_result": {
+                "all_applied": False,
+                "error": "missing_canvas_fix_plan",
+                "checked_count": 0,
+                "applied_count": 0,
+                "failed_count": 0,
+                "results": [],
+            },
+            "post_fix_validation_mode": "canvas_auto_fix_unverified",
+            "response": "No hay canvas_fix_plan determinístico para aplicar.",
+        }
+
+    await get_builder_tools()
+    execute_code = _builder_tools_by_name.get("execute_code")
+
+    if execute_code is None:
+        return {
+            "canvas_auto_fix_result": {
+                "all_applied": False,
+                "error": "execute_code_not_available",
+                "checked_count": len(canvas_fix_plan),
+                "applied_count": 0,
+                "failed_count": len(canvas_fix_plan),
+                "results": [],
+            },
+            "post_fix_validation_mode": "canvas_auto_fix_unverified",
+            "response": "No se pudo aplicar canvas_fix_plan porque execute_code no está disponible.",
+        }
+
+    script = build_apply_canvas_fix_script(canvas_fix_plan)
+
+    try:
+        raw_result = await execute_code.ainvoke({"code": script})
+        application = parse_tool_json_result(raw_result)
+    except Exception as exc:
+        application = {
+            "all_applied": False,
+            "error": repr(exc),
+            "checked_count": len(canvas_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(canvas_fix_plan),
+            "results": [],
+        }
+
+    return {
+        "canvas_auto_fix_result": {
+            "type": "canvas_apply_result",
+            **application,
+        },
+        "post_fix_validation_mode": "canvas_auto_fix_unverified",
+        "response": None,
+    }
+
+
+async def record_canvas_auto_fix_event(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """Record that broad canvas auto-fix mode ran.
+
+    This does not validate the design again and does not claim deterministic
+    success, because broad visual/layout edits cannot be verified with the
+    rename-only structural checker.
+    """
+    fix_iteration = int(state.get("fix_iterations", 0) or 0)
+    validation_report = state.get("validation_report")
+
+    known_targets = state.get("last_canvas_fix_targets", [])
+    canvas_fix_plan = state.get("last_canvas_fix_plan", [])
+    canvas_result = state.get("canvas_auto_fix_result")
+    rename_event = state.get("auto_fix_event")
+
+    if isinstance(canvas_result, dict) and canvas_result.get("error"):
+        canvas_status = "error_unverified"
+    elif isinstance(canvas_result, dict) and canvas_result.get("applied_count"):
+        canvas_status = "applied_unverified"
+    else:
+        canvas_status = "unverified"
+
+    event = {
+        "type": "canvas_auto_fix_execution",
+        "status": canvas_status,
+        "verified_at": utc_now_iso(),
+        "fix_iteration": fix_iteration,
+        "mode": "canvas_auto_fix_known_targets_only",
+        "env_flag": "PENPOT_ENABLE_CANVAS_AUTO_FIX",
+        "confidence_threshold": canvas_confidence_threshold(),
+        "known_target_count": len(known_targets) if isinstance(known_targets, list) else 0,
+        "known_targets": known_targets if isinstance(known_targets, list) else [],
+        "canvas_fix_plan_count": len(canvas_fix_plan) if isinstance(canvas_fix_plan, list) else 0,
+        "canvas_fix_plan": canvas_fix_plan if isinstance(canvas_fix_plan, list) else [],
+        "canvas_apply_result": canvas_result if isinstance(canvas_result, dict) else None,
+        "rename_verification_event": rename_event,
+        "message": (
+            "Canvas auto-fix mode ran after rename_layer fixes were "
+            "structurally verified, or after rename_phase=no_op when no rename "
+            "was needed. The builder was allowed to modify only "
+            "known targets mapped by the validator with sufficient confidence. "
+            "No deterministic visual/layout verification was performed. Run "
+            "validate_only to score the updated design."
+        ),
+        "score_before_fix": (
+            validation_report.get("score") if isinstance(validation_report, dict) else None
+        ),
+        "status_before_fix": (
+            validation_report.get("status") if isinstance(validation_report, dict) else None
+        ),
+    }
+
+    return {
+        "auto_fix_verified": False,
+        "auto_fix_event": event,
+        "auto_fix_verification": {
+            "all_applied": None,
+            "verification_type": "canvas_auto_fix_unverified",
+            "reason": "known-target canvas changes require a fresh validate_only run",
+            "canvas_apply_result": canvas_result if isinstance(canvas_result, dict) else None,
+        },
+        "post_fix_validation_mode": None,
+        "response": (
+            "Canvas auto-fix ejecutado en modo ampliado y limitado a known_targets. "
+            "No se hizo una segunda validación visual automática; corre validate_only "
+            "para obtener un nuevo score del diseño actualizado."
+        ),
     }
 
 
@@ -957,7 +1716,7 @@ def route_after_prepare(
 
 def should_continue_after_llm(
     state: OverallState,
-) -> Literal["tool_node", "run_validator", "verify_auto_fix_plan_applied", "__end__"]:
+) -> Literal["tool_node", "run_validator", "verify_auto_fix_plan_applied", "apply_canvas_fix_plan_deterministic", "record_canvas_auto_fix_event", "__end__"]:
     if state.get("skip_validation"):
         return END
 
@@ -971,13 +1730,44 @@ def should_continue_after_llm(
     if getattr(last_message, "tool_calls", None):
         return "tool_node"
 
-    if state.get("post_fix_validation_mode") == "structure_only":
+    post_fix_mode = state.get("post_fix_validation_mode")
+
+    if post_fix_mode in {"structure_only", "structure_then_canvas"}:
         return "verify_auto_fix_plan_applied"
+
+    if post_fix_mode == "canvas_fix_pending":
+        return "apply_canvas_fix_plan_deterministic"
+
+    if post_fix_mode == "canvas_auto_fix_unverified":
+        return "record_canvas_auto_fix_event"
 
     action = normalize_action(state.get("action"))
 
     if action_requires_validation_after_build(action):
         return "run_validator"
+
+    return END
+
+
+def route_after_fix_design(
+    state: OverallState,
+) -> Literal["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", "__end__"]:
+    post_fix_mode = state.get("post_fix_validation_mode")
+
+    if post_fix_mode == "canvas_fix_pending":
+        return "apply_canvas_fix_plan_deterministic"
+
+    if post_fix_mode in {"structure_only", "structure_then_canvas"}:
+        return "apply_auto_fix_plan_deterministic"
+
+    return END
+
+
+def route_after_auto_fix_verification(
+    state: OverallState,
+) -> Literal["apply_canvas_fix_plan_deterministic", "__end__"]:
+    if state.get("post_fix_validation_mode") == "canvas_fix_pending":
+        return "apply_canvas_fix_plan_deterministic"
 
     return END
 
@@ -993,7 +1783,7 @@ def route_after_validator(
     if validation_passed(state):
         return END
 
-    if not has_auto_fix_plan(state):
+    if not has_executable_fix(state):
         return END
 
     fix_iterations = int(state.get("fix_iterations", 0) or 0)
@@ -1021,7 +1811,10 @@ agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("tool_node", tool_node)
 agent_builder.add_node("run_validator", run_validator)
 agent_builder.add_node("fix_design", fix_design)
+agent_builder.add_node("apply_auto_fix_plan_deterministic", apply_auto_fix_plan_deterministic)
 agent_builder.add_node("verify_auto_fix_plan_applied", verify_auto_fix_plan_applied)
+agent_builder.add_node("apply_canvas_fix_plan_deterministic", apply_canvas_fix_plan_deterministic)
+agent_builder.add_node("record_canvas_auto_fix_event", record_canvas_auto_fix_event)
 
 agent_builder.add_edge(START, "prepare_input")
 
@@ -1034,7 +1827,14 @@ agent_builder.add_conditional_edges(
 agent_builder.add_conditional_edges(
     "llm_call",
     should_continue_after_llm,
-    ["tool_node", "run_validator", "verify_auto_fix_plan_applied", END],
+    [
+        "tool_node",
+        "run_validator",
+        "verify_auto_fix_plan_applied",
+        "apply_canvas_fix_plan_deterministic",
+        "record_canvas_auto_fix_event",
+        END,
+    ],
 )
 
 agent_builder.add_edge("tool_node", "llm_call")
@@ -1045,7 +1845,18 @@ agent_builder.add_conditional_edges(
     ["fix_design", END],
 )
 
-agent_builder.add_edge("fix_design", "llm_call")
-agent_builder.add_edge("verify_auto_fix_plan_applied", END)
+agent_builder.add_conditional_edges(
+    "fix_design",
+    route_after_fix_design,
+    ["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", END],
+)
+agent_builder.add_edge("apply_auto_fix_plan_deterministic", "verify_auto_fix_plan_applied")
+agent_builder.add_conditional_edges(
+    "verify_auto_fix_plan_applied",
+    route_after_auto_fix_verification,
+    ["apply_canvas_fix_plan_deterministic", END],
+)
+agent_builder.add_edge("apply_canvas_fix_plan_deterministic", "record_canvas_auto_fix_event")
+agent_builder.add_edge("record_canvas_auto_fix_event", END)
 
 graph = agent_builder.compile(name="Penpot Design Workflow")

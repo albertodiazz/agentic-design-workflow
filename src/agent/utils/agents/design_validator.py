@@ -905,6 +905,138 @@ def normalize_layers_list(
     return normalized, invalid_count
 
 
+
+def _blank_layer_ref() -> dict[str, Any]:
+    return {
+        "node_ref": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "path": "",
+        "bbox": None,
+    }
+
+
+def _complete_checks(checks: Any) -> dict[str, Any]:
+    check_names = [
+        "screen_structure",
+        "visual_structure_mapping",
+        "layer_naming",
+        "componentization",
+        "layout_spacing",
+        "text_legibility",
+        "accessibility",
+        "frontend_handoff",
+    ]
+    result: dict[str, Any] = {}
+    source = checks if isinstance(checks, dict) else {}
+    for name in check_names:
+        item = source.get(name, {}) if isinstance(source.get(name, {}), dict) else {}
+        notes = item.get("notes", [])
+        if not isinstance(notes, list):
+            notes = [str(notes)] if notes else []
+        result[name] = {
+            "status": item.get("status", "unknown"),
+            "score": int(item.get("score", 0) or 0),
+            "notes": [str(note) for note in notes[:2]],
+        }
+    return result
+
+
+def expand_dvcp_delta_report(
+    report: dict[str, Any],
+    design_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Expand compact DVCP refs into the legacy internal report shape.
+
+    The LLM speaks compact DVCP (`visual_map.ref`, `issues.affected_refs`).
+    Downstream Python keeps using the existing expanded report contract.
+    """
+    if not isinstance(report, dict):
+        return report
+
+    is_compact = "visual_map" in report or any(
+        isinstance(issue, dict) and "affected_refs" in issue
+        for issue in report.get("issues", [])
+        if isinstance(report.get("issues", []), list)
+    )
+    if not is_compact:
+        return report
+
+    nodes_by_ref, _nodes_by_id = build_node_indexes(design_context)
+
+    def layer_from_ref(ref: Any) -> dict[str, Any]:
+        node = nodes_by_ref.get(str(ref or "").strip())
+        if node is None:
+            return _blank_layer_ref()
+        return make_layer_ref_from_node(node)
+
+    visual_map = report.get("visual_map", [])
+    expanded_visual_map: list[dict[str, Any]] = []
+    if isinstance(visual_map, list):
+        for item in visual_map[:20]:
+            if not isinstance(item, dict):
+                continue
+            expanded_visual_map.append(
+                {
+                    "visual_region": item.get("region") or item.get("visual_region") or "",
+                    "inferred_role": item.get("role") or item.get("inferred_role") or "",
+                    "matched_layer": layer_from_ref(item.get("ref") or item.get("node_ref")),
+                    "confidence": item.get("confidence", 0),
+                }
+            )
+
+    issues = report.get("issues", [])
+    expanded_issues: list[dict[str, Any]] = []
+    required_fixes: list[str] = []
+    if isinstance(issues, list):
+        for issue in issues[:8]:
+            if not isinstance(issue, dict):
+                continue
+            refs = issue.get("affected_refs", [])
+            if not isinstance(refs, list):
+                refs = []
+            affected_layers = [layer_from_ref(ref) for ref in refs[:12]]
+            affected_layers = [layer for layer in affected_layers if layer.get("node_ref")]
+            recommendation = str(issue.get("recommendation") or "").strip()
+            if recommendation and recommendation not in required_fixes:
+                required_fixes.append(recommendation)
+            expanded_issues.append(
+                {
+                    "severity": issue.get("severity", "medium"),
+                    "category": issue.get("category", ""),
+                    "message": issue.get("message", ""),
+                    "affected_layers": affected_layers,
+                    "recommendation": recommendation,
+                }
+            )
+
+    expanded = {
+        "passed": bool(report.get("passed", False)),
+        "score": int(report.get("score", 0) or 0),
+        "status": report.get("status", "not_ready"),
+        "summary": report.get("summary", ""),
+        "design_context_summary": design_context.get("summary", {}),
+        "source_errors": design_context.get("source_errors", {}),
+        "visual_structure_map": expanded_visual_map,
+        "checks": _complete_checks(report.get("checks", {})),
+        "issues": expanded_issues,
+        "required_fixes": required_fixes[:8],
+        "suggested_structure": str(report.get("suggested_structure") or "")[:300],
+        "developer_notes": [],
+        "manual_fixes": [],
+        "auto_fix_plan": [],
+        "can_be_sent_to_development": bool(report.get("can_be_sent_to_development", False)),
+        "dvcp": {
+            "protocol_version": report.get("protocol_version", "DVCP/0.1"),
+            "compact_input": True,
+            "llm_output_compact": True,
+            "expanded_by_python": True,
+        },
+    }
+    return expanded
+
+
 def normalize_report_layer_references(
     report: dict[str, Any],
     design_context: dict[str, Any],
@@ -1024,64 +1156,141 @@ def pascal_case(value: str) -> str:
     return "".join(part[:1].upper() + part[1:] for part in parts)
 
 
-def suggest_semantic_layer_name(
+def semantic_layer_name_from_mapping(
     *,
     visual_region: str,
     inferred_role: str,
     layer: dict[str, Any],
 ) -> str | None:
-    """Generate a conservative rename suggestion from visual mapping."""
+    """Generate a canonical semantic name from compact DVCP visual mapping.
+
+    This is intentionally deterministic. The LLM classifies and maps refs;
+    Python decides the concrete rename action.
+    """
     region = str(visual_region or "").strip().lower()
     role = str(inferred_role or "").strip().lower()
+    current_name = str(layer.get("name") or "").strip().lower()
     layer_type = str(layer.get("type") or "").strip().lower()
-    text_value = str(layer.get("text") or "").strip().lower()
-    combined = f"{region} {role} {text_value}"
+    combined = f"{region} {role} {current_name}"
 
-    # Specific UI roles first.
+    is_text = "text" in layer_type or "text" in role or "label" in role or "heading" in role
+    is_shape = any(token in layer_type for token in ["rect", "shape", "path", "ellipse"])
+
     if "email" in combined:
-        if "background" in combined or "input" in combined or "rectangle" in layer_type:
+        if "label" in combined or (is_text and "background" not in combined):
+            return "EmailInputLabelText"
+        if is_shape or "background" in combined or "input" in combined:
             return "EmailInputBackground"
-        return "EmailInputLabel"
 
     if "password" in combined or "contraseña" in combined:
-        if "background" in combined or "input" in combined or "rectangle" in layer_type:
+        if "label" in combined or (is_text and "background" not in combined):
+            return "PasswordInputLabelText"
+        if is_shape or "background" in combined or "input" in combined:
             return "PasswordInputBackground"
-        return "PasswordInputLabel"
-
-    if "button" in combined or "login" in combined or "iniciar" in combined:
-        if "text" in role or "text" in layer_type:
-            return "LoginButtonText"
-        return "LoginButtonBackground"
 
     if "title" in combined or "heading" in combined:
         return "LoginTitleText"
 
-    if "container" in combined or "background" in combined:
-        return "LoginCardBackground"
+    if "button" in combined or "iniciar" in combined:
+        if "button_text" in combined or (is_text and "background" not in combined):
+            return "LoginButtonText"
+        if is_shape or "background" in combined or "button" in combined:
+            return "LoginButtonBackground"
 
-    # Generic fallback based on model role + layer type.
+    if "login" in combined and ("button" in combined or "submit" in combined):
+        if is_text and "background" not in combined:
+            return "LoginButtonText"
+        if is_shape or "background" in combined:
+            return "LoginButtonBackground"
+
+    if "card" in combined or "container" in combined or "background" in combined:
+        if not is_text:
+            return "LoginCardBackground"
+
     if role:
         base = pascal_case(role)
-        if "text" in layer_type and not base.endswith("Text"):
+        if is_text and not base.endswith("Text"):
             base += "Text"
-        if "rectangle" in layer_type and not base.endswith(("Background", "Container")):
+        if is_shape and not base.endswith(("Background", "Container")):
             base += "Background"
         return base
 
     return None
 
 
+def suggest_semantic_layer_name(
+    *,
+    visual_region: str,
+    inferred_role: str,
+    layer: dict[str, Any],
+) -> str | None:
+    """Backward-compatible wrapper for semantic naming."""
+    return semantic_layer_name_from_mapping(
+        visual_region=visual_region,
+        inferred_role=inferred_role,
+        layer=layer,
+    )
+
+
+def _rename_confidence_threshold() -> float:
+    raw_value = os.getenv(
+        "PENPOT_RENAME_AUTO_FIX_MIN_CONFIDENCE",
+        os.getenv("PENPOT_CANVAS_AUTO_FIX_MIN_CONFIDENCE", "0.8"),
+    )
+    try:
+        return float(raw_value)
+    except Exception:
+        return 0.8
+
+
+def _naming_issue_refs(report: dict[str, Any]) -> set[str]:
+    issues = report.get("issues", [])
+    if not isinstance(issues, list):
+        return set()
+
+    naming_categories = {
+        "naming",
+        "layer_naming",
+        "naming_convention",
+        "semantic_naming",
+    }
+    refs: set[str] = set()
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        category = str(issue.get("category") or "").strip().lower()
+        if category not in naming_categories:
+            continue
+        layers = issue.get("affected_layers", [])
+        if not isinstance(layers, list):
+            continue
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            node_ref = str(layer.get("node_ref") or "").strip()
+            if node_ref:
+                refs.add(node_ref)
+
+    return refs
+
+
 def build_auto_fix_plan(report: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Build a deterministic, safe auto-fix plan from the normalized visual map.
+    Build a deterministic, safe auto-fix plan from normalized DVCP output.
 
-    First phase is intentionally conservative: only rename generic layers.
-    No layout, color, text, component, or accessibility mutation is planned here.
+    Phase 1 remains rename-only. It now handles two safe cases:
+    - generic layer names, e.g. Rectangle 1 -> EmailInputBackground
+    - explicit layer_naming issues, e.g. EmailInputLabel -> EmailInputLabelText
+
+    The LLM never emits commands. It only maps refs and raises issues.
     """
     visual_map = report.get("visual_structure_map", [])
     if not isinstance(visual_map, list):
         return []
 
+    confidence_threshold = _rename_confidence_threshold()
+    naming_refs = _naming_issue_refs(report)
     plan: list[dict[str, Any]] = []
     used_ids: set[str] = set()
     used_new_names: set[str] = set()
@@ -1098,16 +1307,22 @@ def build_auto_fix_plan(report: dict[str, Any]) -> list[dict[str, Any]]:
         layer_id = str(layer.get("id") or "").strip()
         current_name = str(layer.get("name") or "").strip()
 
-        if not node_ref or not layer_id:
+        if not node_ref or not layer_id or layer_id in used_ids:
             continue
 
-        if layer_id in used_ids:
+        try:
+            confidence = float(item.get("confidence", 0) or 0)
+        except Exception:
+            confidence = 0.0
+
+        if confidence < confidence_threshold:
             continue
 
-        if not is_generic_layer_name(current_name):
+        is_naming_issue_target = node_ref in naming_refs
+        if not is_naming_issue_target and not is_generic_layer_name(current_name):
             continue
 
-        suggested_name = suggest_semantic_layer_name(
+        suggested_name = semantic_layer_name_from_mapping(
             visual_region=str(item.get("visual_region") or ""),
             inferred_role=str(item.get("inferred_role") or ""),
             layer=layer,
@@ -1135,7 +1350,11 @@ def build_auto_fix_plan(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "type": layer.get("type", ""),
                 "path": layer.get("path", ""),
                 "bbox": layer.get("bbox"),
-                "reason": "Layer name is generic and does not describe its visual/frontend role.",
+                "confidence": confidence,
+                "reason": (
+                    "Layer is affected by a naming issue or has a generic name; "
+                    "Python generated a deterministic canonical semantic name."
+                ),
                 "safety": "safe_auto_fix",
             }
         )
@@ -1201,16 +1420,80 @@ def attach_fix_plans(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def make_compact_design_context(design_context: dict[str, Any]) -> dict[str, Any]:
-    """Return only the information Mistral needs for visual-layer mapping."""
+def _node_refs_where(nodes: list[dict[str, Any]], predicate: Any) -> list[str]:
+    refs: list[str] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_ref = str(node.get("node_ref") or "").strip()
+        if node_ref and predicate(node):
+            refs.append(node_ref)
+    return refs
+
+
+def make_dvcp_design_snapshot(design_context: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact set/reference snapshot for the LLM.
+
+    DVCP rule: the LLM sees the universe U and refers to layers by node_ref.
+    It must not repeat Penpot ids/names/paths in every issue.
+    """
+    raw_nodes = design_context.get("nodes", [])
+    nodes = [node for node in raw_nodes if isinstance(node, dict)][:MAX_CONTEXT_NODES]
+
+    def node_type(node: dict[str, Any]) -> str:
+        return str(node.get("type") or "").lower()
+
+    def semantic_text(node: dict[str, Any]) -> str:
+        return f"{node.get('name') or ''} {node.get('text') or ''} {node.get('role_guess') or ''}".lower()
+
+    node_table = []
+    for node in nodes:
+        node_table.append(
+            {
+                "ref": node.get("node_ref", ""),
+                "name": node.get("name", ""),
+                "type": node.get("type", ""),
+                "text": node.get("text"),
+                "role_guess": node.get("role_guess"),
+                "bbox": {
+                    "x": node.get("x"),
+                    "y": node.get("y"),
+                    "w": node.get("width"),
+                    "h": node.get("height"),
+                },
+            }
+        )
+
+    sets = {
+        "Text": _node_refs_where(nodes, lambda n: "text" in node_type(n)),
+        "Shape": _node_refs_where(nodes, lambda n: any(t in node_type(n) for t in ["rect", "ellipse", "path", "shape"])),
+        "Container": _node_refs_where(nodes, lambda n: any(t in node_type(n) for t in ["group", "frame", "board"])),
+        "Component": _node_refs_where(nodes, lambda n: bool(n.get("componentId") or n.get("componentName"))),
+        "InputCandidates": _node_refs_where(nodes, lambda n: any(w in semantic_text(n) for w in ["input", "field", "email", "password", "contraseña"])),
+        "ButtonCandidates": _node_refs_where(nodes, lambda n: any(w in semantic_text(n) for w in ["button", "btn", "login", "submit", "iniciar"])),
+        "LabelCandidates": _node_refs_where(nodes, lambda n: "label" in semantic_text(n) or "placeholder" in semantic_text(n)),
+        "GenericNames": _node_refs_where(nodes, lambda n: is_generic_layer_name(n.get("name"))),
+    }
+
     return {
+        "protocol_version": "DVCP/0.1",
         "root_shape_id": design_context.get("root_shape_id"),
         "summary": design_context.get("summary", {}),
         "source_errors": design_context.get("source_errors", {}),
-        "overview_preview": design_context.get("overview_preview"),
-        "nodes": design_context.get("nodes", [])[:MAX_CONTEXT_NODES],
-        "purpose": design_context.get("purpose", "visual_layer_mapping"),
+        "U": [node.get("node_ref", "") for node in nodes if node.get("node_ref")],
+        "node_table": node_table,
+        "sets": sets,
+        "rules": {
+            "reference_only": "Use only refs from U in visual_map.ref and issues.affected_refs.",
+            "no_layer_objects": "Do not repeat id/name/type/path in the LLM output.",
+            "no_fix_commands": "Do not generate auto_fix_plan or manual_fixes; Python generates plans after normalization.",
+        },
     }
+
+
+def make_compact_design_context(design_context: dict[str, Any]) -> dict[str, Any]:
+    """Return the compact DVCP snapshot Mistral needs for visual-layer mapping."""
+    return make_dvcp_design_snapshot(design_context)
 
 
 def attach_design_context_to_report(
@@ -1229,7 +1512,7 @@ def build_visual_prompt(
     design_context: dict[str, Any] | None = None,
 ) -> str:
     contract_json = json.dumps(
-        load_json_resource("schemas/validator_report_contract.json"),
+        load_json_resource("schemas/validator_delta_contract.json"),
         ensure_ascii=False,
         indent=2,
         default=str,
@@ -1370,7 +1653,7 @@ async def validator_visual_call(
             model=os.getenv("MISTRAL_VISION_MODEL", "mistral-large-2512"),
             temperature=0,
             response_format={"type": "json_object"},
-            max_tokens=int(os.getenv("MISTRAL_VISION_MAX_TOKENS", "6000")),
+            max_tokens=int(os.getenv("MISTRAL_VISION_MAX_TOKENS", "2500")),
         )
 
         compact_design_context = make_compact_design_context(design_context)
@@ -1385,10 +1668,10 @@ async def validator_visual_call(
                 vision_runnable,
                 [HumanMessage(content=visual_prompt)],
                 estimated_completion_tokens=int(
-                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "6000")
+                    os.getenv("MISTRAL_VISION_ESTIMATED_COMPLETION_TOKENS", "2500")
                 ),
                 extra_estimated_tokens=int(
-                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "2500")
+                    os.getenv("MISTRAL_VISION_EXTRA_ESTIMATED_TOKENS", "1500")
                 ),
             )
         except Exception as exc:
@@ -1410,6 +1693,7 @@ async def validator_visual_call(
             )
 
         if isinstance(report, dict):
+            report = expand_dvcp_delta_report(report, design_context)
             report = attach_design_context_to_report(report, design_context)
             report = normalize_report_layer_references(report, design_context)
             report = attach_fix_plans(report)

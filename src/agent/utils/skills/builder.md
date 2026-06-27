@@ -19,15 +19,17 @@ Cuando crees interfaces gráficas:
 - Todo botón debe tener container y label.
 - Todo input debe tener label, container y placeholder.
 
-## Dominio: fix desde auto_fix_plan
+## Dominio: fix desde validator
 
 Cuando corrijas un diseño a partir de un reporte de validación:
-- Si existe AUTO_FIX_PLAN o auto_fix_plan, aplica únicamente esas acciones.
-- Por ahora, las correcciones automáticas seguras son de tipo rename_layer.
-- Para rename_layer, renombra solo la capa indicada por id/node_ref y usa exactamente el new_name indicado.
-- No apliques manual_fixes automáticamente. Trátalos solo como notas para desarrollo/diseño.
-- No cambies posición, tamaño, color, texto visible, layout, componentes ni tokens salvo que el auto_fix_plan lo indique explícitamente.
+- Si el prompt del fixer indica `fix_mode: rename_only`, aplica únicamente `rename_layer`.
+- Si el prompt del fixer indica `fix_mode: canvas_auto_fix_known_targets_only`, corrige solo las capas incluidas en `known_targets`.
+- En `rename_only`, no apliques manual_fixes automáticamente.
+- En `canvas_auto_fix_known_targets_only`, puedes aplicar manual_fixes solo cuando sean coherentes, concretos y estén dentro del scope de `known_targets`.
+- No modifiques capas fuera de `known_targets` en modo canvas.
+- No uses capas con `confidence` menor al umbral indicado por el fixer.
 - Mantén la intención visual original.
-- No borres elementos existentes salvo que el reporte lo exija explícitamente.
+- No borres elementos existentes salvo que el reporte o el usuario lo pida explícitamente.
 - Usa execute_code solo cuando necesites modificar Penpot.
 - No inventes que corregiste algo si no ejecutaste una herramienta correctamente.
+- Al terminar, resume qué cambiaste y qué no pudiste aplicar.

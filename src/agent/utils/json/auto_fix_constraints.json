@@ -13,5 +13,27 @@
     "create_component",
     "detach_component",
     "change_layout"
+  ],
+  "canvas_confidence_threshold": 0.8,
+  "canvas_allowed_actions": [
+    "rename_layer",
+    "move_layer",
+    "resize_layer",
+    "create_layer",
+    "change_text_content",
+    "change_color",
+    "change_typography",
+    "group_layers",
+    "create_component",
+    "change_layout",
+    "adjust_spacing",
+    "update_visual_hierarchy"
+  ],
+  "canvas_forbidden_actions": [
+    "delete_layer_without_explicit_reason",
+    "redesign_unrelated_areas",
+    "invent_new_product_features",
+    "modify_outside_known_targets",
+    "use_low_confidence_targets"
   ]
 }
