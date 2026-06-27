@@ -25,6 +25,10 @@ from agent.utils.llm_control import (
     shared_rate_limiter,
     usage_updates_from_metered_result,
 )
+from agent.utils.resource_loader import (
+    load_js,
+    read_skill,
+)
 
 from agent.utils.fixer_prompt import build_fix_design_prompt
 
@@ -93,41 +97,8 @@ def action_allows_fixing(action: str) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Builder prompt
+# Builder prompt resources live in utils/skills
 # ---------------------------------------------------------------------
-
-BUILDER_SYSTEM_PROMPT = """
-Eres un agente conectado a Penpot mediante MCP.
-
-Cuando el usuario pida crear, modificar o inspeccionar diseño:
-- Usa las herramientas disponibles.
-- Si necesitas entender la API de Penpot, usa high_level_overview.
-- Si necesitas detalles técnicos, usa penpot_api_info.
-- Para crear o modificar elementos en la página actual, usa execute_code.
-- No digas que hiciste un cambio si no ejecutaste una herramienta correctamente.
-- No borres elementos existentes salvo que el usuario lo pida explícitamente.
-
-Cuando crees interfaces gráficas:
-- Usa nombres semánticos para capas y grupos.
-- Evita nombres genéricos como Rectangle 1, Text 2 o Group 3.
-- Organiza la interfaz pensando en handoff frontend.
-- Usa estructura tipo Atomic Design cuando aplique.
-- Usa una escala consistente de espaciado: 4, 8, 12, 16, 24, 32, 48.
-- Todo botón debe tener container y label.
-- Todo input debe tener label, container y placeholder.
-
-Cuando corrijas un diseño a partir de un reporte de validación:
-- Si existe AUTO_FIX_PLAN o auto_fix_plan, aplica únicamente esas acciones.
-- Por ahora, las correcciones automáticas seguras son de tipo rename_layer.
-- Para rename_layer, renombra solo la capa indicada por id/node_ref y usa exactamente el new_name indicado.
-- No apliques manual_fixes automáticamente. Trátalos solo como notas para desarrollo/diseño.
-- No cambies posición, tamaño, color, texto visible, layout, componentes ni tokens salvo que el auto_fix_plan lo indique explícitamente.
-- Mantén la intención visual original.
-- No borres elementos existentes salvo que el reporte lo exija explícitamente.
-- Usa execute_code solo cuando necesites modificar Penpot.
-- No inventes que corregiste algo si no ejecutaste una herramienta correctamente.
-"""
-
 
 # ---------------------------------------------------------------------
 # Markdown policy loaders
@@ -492,81 +463,12 @@ def parse_tool_json_result(value: Any) -> dict[str, Any]:
 
 
 def build_verify_rename_script(expected_plan: list[dict[str, Any]]) -> str:
-    """Build a read-only Penpot Plugin API script to verify rename_layer actions."""
+    """Render the read-only Penpot Plugin API script that verifies rename_layer actions."""
     expected_json = json.dumps(expected_plan, ensure_ascii=False, default=str)
-
-    return f"""
-function toArray(value) {{
-  if (!value) return [];
-  try {{
-    return Array.from(value);
-  }} catch (err) {{
-    return [];
-  }}
-}}
-
-function walk(shape, out) {{
-  if (!shape) return;
-
-  if (shape.id) {{
-    out[String(shape.id)] = {{
-      id: String(shape.id),
-      name: shape.name ? String(shape.name) : "",
-      type: shape.type ? String(shape.type) : ""
-    }};
-  }}
-
-  var children = toArray(shape.children);
-  for (var i = 0; i < children.length; i++) {{
-    walk(children[i], out);
-  }}
-}}
-
-var expected = {expected_json};
-var shapesById = {{}};
-
-var currentPage = penpot.currentPage || null;
-var selection = toArray(penpot.selection);
-var roots = selection.length > 0
-  ? selection
-  : (currentPage ? toArray(currentPage.children) : []);
-
-for (var i = 0; i < roots.length; i++) {{
-  walk(roots[i], shapesById);
-}}
-
-var results = expected.map(function (item) {{
-  var id = String(item.id || "");
-  var expectedName = String(item.new_name || "");
-  var actual = shapesById[id] || null;
-
-  return {{
-    action: item.action || "",
-    node_ref: item.node_ref || "",
-    id: id,
-    expected_name: expectedName,
-    actual_name: actual ? actual.name : null,
-    actual_type: actual ? actual.type : null,
-    found: actual !== null,
-    applied: actual !== null && actual.name === expectedName
-  }};
-}});
-
-var appliedCount = results.filter(function (item) {{
-  return item.applied === true;
-}}).length;
-
-var allApplied = results.length > 0 && appliedCount === results.length;
-
-return JSON.stringify({{
-  all_applied: allApplied,
-  checked_count: results.length,
-  applied_count: appliedCount,
-  failed_count: results.length - appliedCount,
-  results: results
-}});
-"""
-
+    return load_js("penpot_verify_rename_plan.js").replace(
+        "__EXPECTED_PLAN_JSON__",
+        expected_json,
+    )
 
 def build_auto_fix_event(
     *,
@@ -682,7 +584,7 @@ async def llm_call(
             }
 
         llm_messages = [
-            SystemMessage(content=BUILDER_SYSTEM_PROMPT),
+            SystemMessage(content=read_skill("builder.md")),
             *messages,
         ]
 
@@ -810,23 +712,10 @@ async def run_validator(
     """
 
     try:
-        validator_prompt = (
-            "Valida visualmente la pantalla actual de Penpot para handoff frontend. "
-            "Usa la imagen PNG exportada desde Penpot como fuente principal. "
-            "Evalúa estructura visual, layout, espaciado, legibilidad, accesibilidad básica "
-            "y preparación general para desarrollo frontend. Devuelve JSON válido."
-        )
-
-        original_user_request = state.get("changeme")
-
-        if original_user_request:
-            validator_prompt += (
-                "\n\nSolicitud original del usuario/contexto de diseño:\n"
-                f"{original_user_request}"
-            )
+        validator_context = state.get("changeme") or ""
 
         validation_result = await validator_graph.ainvoke(
-            {"changeme": validator_prompt}
+            {"changeme": validator_context}
         )
 
         validator_input_tokens = int(validation_result.get("input_tokens") or 0)

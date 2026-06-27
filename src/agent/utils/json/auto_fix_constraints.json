@@ -1,0 +1,17 @@
+{
+  "allowed_actions": [
+    "rename_layer"
+  ],
+  "forbidden_actions": [
+    "move_layer",
+    "resize_layer",
+    "delete_layer",
+    "create_layer",
+    "change_text_content",
+    "change_color",
+    "change_typography",
+    "create_component",
+    "detach_component",
+    "change_layout"
+  ]
+}

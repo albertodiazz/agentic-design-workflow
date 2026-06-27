@@ -1,0 +1,101 @@
+{
+  "passed": false,
+  "score": 0,
+  "status": "not_ready",
+  "summary": "",
+  "design_context_summary": {
+    "root_shape_id": "",
+    "node_count": 0,
+    "available_sources": [],
+    "failed_sources": []
+  },
+  "visual_structure_map": [
+    {
+      "visual_region": "",
+      "inferred_role": "",
+      "matched_layer": {
+        "node_ref": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "path": ""
+      },
+      "confidence": 0.0
+    }
+  ],
+  "checks": {
+    "screen_structure": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "visual_structure_mapping": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "layer_naming": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "componentization": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "layout_spacing": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "text_legibility": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "accessibility": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    },
+    "frontend_handoff": {
+      "status": "unknown",
+      "score": 0,
+      "notes": []
+    }
+  },
+  "issues": [
+    {
+      "severity": "medium",
+      "category": "",
+      "message": "",
+      "affected_layers": [
+        {
+          "node_ref": "",
+          "id": "",
+          "name": "",
+          "type": "",
+          "path": ""
+        }
+      ],
+      "recommendation": ""
+    }
+  ],
+  "required_fixes": [],
+  "suggested_structure": "",
+  "developer_notes": [],
+  "manual_fixes": [],
+  "auto_fix_plan": [
+    {
+      "action": "rename_layer",
+      "node_ref": "",
+      "id": "",
+      "current_name": "",
+      "new_name": "",
+      "reason": "",
+      "safety": "safe_auto_fix"
+    }
+  ],
+  "can_be_sent_to_development": false
+}

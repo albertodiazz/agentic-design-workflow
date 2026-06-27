@@ -9,6 +9,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from agent.utils.resource_loader import (
+    load_json_resource,
+    render_skill,
+)
+
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
@@ -63,63 +68,66 @@ def build_fix_design_prompt(
     fix_iteration: int = 0,
     max_fix_iterations: int = 1,
 ) -> str:
-    """Build the prompt consumed by the Builder after validation fails.
-
-    Phase 1 is intentionally conservative: only safe layer renames are automated.
-    Component creation, token systems, contrast checks and accessibility details stay
-    as manual notes until the rename loop is stable.
-    """
+    """Build the prompt consumed by the Builder after validation fails."""
     if not isinstance(validation_report, dict):
-        return (
-            "No se puede corregir automáticamente porque validation_report no es un dict válido. "
-            "No modifiques Penpot. Devuelve un resumen del problema."
+        return render_skill(
+            "fixer.md",
+            {
+                "MODE": "invalid_report",
+                "PLAN_JSON": "{}",
+                "VALIDATION_REPORT_SUMMARY_JSON": json.dumps(
+                    {"error": "validation_report is not a valid dict"},
+                    ensure_ascii=False,
+                    default=str,
+                    indent=2,
+                ),
+            },
         )
 
     safe_plan = _safe_rename_plan(validation_report)
     manual_fixes = _as_list(validation_report.get("manual_fixes"))
 
     if not safe_plan:
-        return (
-            "El validador no generó auto_fix_plan seguro. "
-            "No modifiques Penpot automáticamente. "
-            "Resume los problemas principales y pide una validación/manual review.\n\n"
-            f"validation_report_summary={json.dumps({
-                'score': validation_report.get('score'),
-                'status': validation_report.get('status'),
-                'summary': validation_report.get('summary'),
-                'manual_fixes': manual_fixes,
-            }, ensure_ascii=False, default=str)}"
+        summary = {
+            "score": validation_report.get("score"),
+            "status": validation_report.get("status"),
+            "summary": validation_report.get("summary"),
+            "manual_fixes": manual_fixes,
+        }
+        return render_skill(
+            "fixer.md",
+            {
+                "MODE": "no_auto_fix",
+                "PLAN_JSON": "{}",
+                "VALIDATION_REPORT_SUMMARY_JSON": json.dumps(
+                    summary,
+                    ensure_ascii=False,
+                    default=str,
+                    indent=2,
+                ),
+            },
         )
 
+    constraints = load_json_resource("auto_fix_constraints.json")
     payload = {
         "fix_iteration": fix_iteration,
         "max_fix_iterations": max_fix_iterations,
-        "allowed_actions": ["rename_layer"],
-        "forbidden_actions": [
-            "move_layer",
-            "resize_layer",
-            "delete_layer",
-            "create_layer",
-            "change_text_content",
-            "change_color",
-            "change_typography",
-            "create_component",
-            "detach_component",
-            "change_layout",
-        ],
+        "allowed_actions": constraints.get("allowed_actions", ["rename_layer"]),
+        "forbidden_actions": constraints.get("forbidden_actions", []),
         "auto_fix_plan": safe_plan,
         "manual_fixes_not_to_apply_now": manual_fixes,
     }
 
-    return (
-        "Corrige el diseño actual de Penpot aplicando SOLO el auto_fix_plan seguro.\n\n"
-        "Objetivo de esta iteración:\n"
-        "- Renombrar capas genéricas usando los IDs reales proporcionados.\n"
-        "- No cambiar posición, tamaño, color, texto visible, jerarquía, componentes ni layout.\n"
-        "- No intentes resolver accesibilidad, tokens, componentes ni estados interactivos todavía.\n"
-        "- Usa herramientas de escritura de Penpot solo para renombrar las capas indicadas.\n"
-        "- Si una capa por ID no existe, omítela y reporta cuál falló.\n"
-        "- Al terminar, responde con un resumen breve de renombres aplicados.\n\n"
-        "PLAN_JSON:\n"
-        f"{json.dumps(payload, ensure_ascii=False, default=str, indent=2)}"
+    return render_skill(
+        "fixer.md",
+        {
+            "MODE": "auto_fix",
+            "PLAN_JSON": json.dumps(
+                payload,
+                ensure_ascii=False,
+                default=str,
+                indent=2,
+            ),
+            "VALIDATION_REPORT_SUMMARY_JSON": "{}",
+        },
     )

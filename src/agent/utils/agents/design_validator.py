@@ -43,6 +43,11 @@ from agent.utils.penpot_image_export import (
     save_debug_png_export,
     to_plain,
 )
+from agent.utils.resource_loader import (
+    load_js,
+    load_json_resource,
+    render_skill,
+)
 
 
 # ---------------------------------------------------------------------
@@ -56,164 +61,8 @@ PENPOT_WRITE_TOOLS_PATH = AGENT_ROOT_DIR / "utils" / "tool_policies" / "penpot_w
 
 
 # ---------------------------------------------------------------------
-# Visual validator prompt
+# Prompt resources live in utils/skills and utils/json
 # ---------------------------------------------------------------------
-
-VISUAL_VALIDATOR_PROMPT = """
-Eres un agente validador visual de diseño UI conectado a Penpot mediante MCP.
-
-Vas a recibir dos fuentes de evidencia:
-1. Una imagen PNG exportada desde Penpot.
-2. Un JSON llamado DESIGN_CONTEXT_JSON con estructura real de Penpot: tools usadas, capas, nombres, tipos, textos, bounding boxes, jerarquía parcial y componentes cuando estén disponibles.
-
-Tu tarea es evaluar si la pantalla está lista para handoff frontend y asociar hallazgos visuales con capas/componentes concretos de Penpot.
-
-Debes responder únicamente con JSON válido. No uses Markdown. No agregues explicación fuera del JSON.
-
-Reglas importantes:
-- Usa la imagen como evidencia visual.
-- Usa DESIGN_CONTEXT_JSON para mapear lo visible contra capas reales.
-- No inventes IDs, nombres ni paths. Si no hay match claro, usa affected_layers: [].
-- Usa `node_ref` como identificador primario para referenciar capas. Si puedes asociar una región con una capa, copia exactamente node_ref, id, name, type y path desde DESIGN_CONTEXT_JSON.
-- Cuando detectes un problema, intenta asociarlo con capas usando bbox, texto, nombre, tipo, jerarquía y posición visual.
-- Si una capa tiene nombre genérico como "Rectangle 1", "Text 2" o "Group 3", evalúa si su función visual puede inferirse: background, card, button, input, heading, label, icon, image, container.
-- Si no puedes verificar tokens o componentes, marca el check como "unknown" o "warning", pero explica qué faltó.
-
-Evalúa:
-- existencia de una pantalla o frame principal
-- relación entre estructura visual y estructura de capas
-- claridad semántica de nombres de capas
-- uso aparente de componentes reutilizables
-- layout y espaciado
-- legibilidad de textos
-- accesibilidad básica
-- consistencia visual
-- preparación para handoff frontend
-
-Criterio simple para passed:
-- passed=true si score >= 70, la pantalla parece entendible para desarrollo y no hay problemas critical/high evidentes.
-- passed=false si la información es insuficiente, la pantalla no es clara, hay problemas graves o score < 70.
-
-Valores permitidos para checks.*.status:
-pass, warning, fail, unknown
-
-Valores permitidos para issues[].severity:
-low, medium, high, critical
-
-Valores permitidos para status:
-ready, needs_minor_fixes, needs_major_fixes, not_ready
-
-Reglas de status:
-- ready: score >= 85 y sin problemas graves
-- needs_minor_fixes: score entre 70 y 84
-- needs_major_fixes: score entre 50 y 69
-- not_ready: score menor a 50 o información insuficiente
-
-Devuelve exactamente esta estructura JSON:
-
-{
-  "passed": false,
-  "score": 0,
-  "status": "not_ready",
-  "summary": "",
-  "design_context_summary": {
-    "root_shape_id": "",
-    "node_count": 0,
-    "available_sources": [],
-    "failed_sources": []
-  },
-  "visual_structure_map": [
-    {
-      "visual_region": "",
-      "inferred_role": "",
-      "matched_layer": {
-        "node_ref": "",
-        "id": "",
-        "name": "",
-        "type": "",
-        "path": ""
-      },
-      "confidence": 0.0
-    }
-  ],
-  "checks": {
-    "screen_structure": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "visual_structure_mapping": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "layer_naming": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "componentization": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "layout_spacing": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "text_legibility": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "accessibility": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    },
-    "frontend_handoff": {
-      "status": "unknown",
-      "score": 0,
-      "notes": []
-    }
-  },
-  "issues": [
-    {
-      "severity": "medium",
-      "category": "",
-      "message": "",
-      "affected_layers": [
-        {
-          "node_ref": "",
-          "id": "",
-          "name": "",
-          "type": "",
-          "path": ""
-        }
-      ],
-      "recommendation": ""
-    }
-  ],
-  "required_fixes": [],
-  "suggested_structure": "",
-  "developer_notes": [],
-  "manual_fixes": [],
-  "auto_fix_plan": [
-    {
-      "action": "rename_layer",
-      "node_ref": "",
-      "id": "",
-      "current_name": "",
-      "new_name": "",
-      "reason": "",
-      "safety": "safe_auto_fix"
-    }
-  ],
-  "can_be_sent_to_development": false
-}
-""".strip()
-
 
 # ---------------------------------------------------------------------
 # Markdown loaders and tool policy
@@ -559,179 +408,8 @@ MAX_CONTEXT_CHARS = int(os.getenv("PENPOT_VALIDATOR_CONTEXT_CHARS", "9000"))
 MAX_CONTEXT_NODES = int(os.getenv("PENPOT_VALIDATOR_MAX_CONTEXT_NODES", "80"))
 
 
-READ_ONLY_STRUCTURE_SCRIPT = r"""
-function toArray(value) {
-  if (!value) return [];
-  try {
-    return Array.from(value);
-  } catch (err) {
-    return [];
-  }
-}
+# Penpot read-structure JavaScript lives in utils/js/penpot_read_structure.js
 
-function asNumber(value) {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  return null;
-}
-
-function asString(value) {
-  if (value === null || value === undefined) {
-    return "";
-  }
-  return String(value);
-}
-
-function safePlain(value, maxItems) {
-  if (value === null || value === undefined) {
-    return null;
-  }
-
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.slice(0, maxItems || 8).map(function (item) {
-      return safePlain(item, maxItems);
-    });
-  }
-
-  try {
-    var out = {};
-    var keys = Object.keys(value).slice(0, maxItems || 12);
-
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i];
-      var item = value[key];
-
-      if (typeof item !== "function") {
-        out[key] = safePlain(item, maxItems);
-      }
-    }
-
-    return out;
-  } catch (err) {
-    return String(value);
-  }
-}
-
-function readText(shape) {
-  if (!shape) return null;
-
-  if (shape.characters !== undefined && shape.characters !== null) {
-    return String(shape.characters);
-  }
-
-  if (shape.text !== undefined && shape.text !== null) {
-    return String(shape.text);
-  }
-
-  if (shape.content !== undefined && shape.content !== null) {
-    return String(shape.content);
-  }
-
-  return null;
-}
-
-function readChildren(shape) {
-  if (!shape) return [];
-
-  var candidates = [
-    shape.children,
-    shape.shapes,
-    shape.items
-  ];
-
-  for (var i = 0; i < candidates.length; i++) {
-    var arr = toArray(candidates[i]);
-    if (arr.length > 0) {
-      return arr;
-    }
-  }
-
-  return [];
-}
-
-function serializeShape(shape, depth, path) {
-  if (!shape || depth > 8) {
-    return null;
-  }
-
-  var id = asString(shape.id);
-  var type = asString(shape.type || shape.shapeType);
-  var name = asString(shape.name);
-  var label = name || type || id || "unnamed";
-  var currentPath = path ? path + " / " + label : label;
-
-  var children = [];
-  var rawChildren = readChildren(shape);
-
-  for (var i = 0; i < rawChildren.length; i++) {
-    var child = serializeShape(rawChildren[i], depth + 1, currentPath);
-    if (child) {
-      children.push(child);
-    }
-  }
-
-  return {
-    id: id,
-    name: name,
-    type: type,
-    path: currentPath,
-
-    x: asNumber(shape.x),
-    y: asNumber(shape.y),
-    width: asNumber(shape.width),
-    height: asNumber(shape.height),
-    rotation: asNumber(shape.rotation),
-
-    visible: shape.visible !== false && shape.hidden !== true,
-    locked: shape.locked === true,
-
-    text: readText(shape),
-
-    fills: safePlain(shape.fills, 6),
-    strokes: safePlain(shape.strokes, 6),
-    opacity: asNumber(shape.opacity),
-
-    fontFamily: shape.fontFamily ? String(shape.fontFamily) : null,
-    fontSize: asNumber(shape.fontSize),
-    fontWeight: shape.fontWeight ? String(shape.fontWeight) : null,
-    lineHeight: shape.lineHeight ? safePlain(shape.lineHeight, 4) : null,
-
-    componentId: shape.componentId ? String(shape.componentId) : null,
-    componentName: shape.component && shape.component.name ? String(shape.component.name) : null,
-
-    children: children
-  };
-}
-
-var selection = toArray(penpot.selection);
-var currentPage = penpot.currentPage || null;
-var pageChildren = currentPage ? readChildren(currentPage) : [];
-var roots = selection.length > 0 ? selection : pageChildren;
-
-var result = {
-  file: {
-    id: penpot.currentFile && penpot.currentFile.id ? String(penpot.currentFile.id) : "",
-    name: penpot.currentFile && penpot.currentFile.name ? String(penpot.currentFile.name) : ""
-  },
-  page: {
-    id: currentPage && currentPage.id ? String(currentPage.id) : "",
-    name: currentPage && currentPage.name ? String(currentPage.name) : ""
-  },
-  root_source: selection.length > 0 ? "selection" : "current_page_children",
-  selection_count: selection.length,
-  root_count: roots.length,
-  roots: roots.map(function (shape) {
-    return serializeShape(shape, 0, "");
-  }).filter(Boolean)
-};
-
-return JSON.stringify(result);
-"""
 
 
 def extract_text_from_tool_result(result: Any) -> str:
@@ -1096,7 +774,7 @@ async def collect_design_context(shape_id: str) -> dict[str, Any]:
         try:
             raw_result = await execute_code.ainvoke(
                 {
-                    "code": READ_ONLY_STRUCTURE_SCRIPT,
+                    "code": load_js("penpot_read_structure.js"),
                 }
             )
             raw_text = extract_text_from_tool_result(raw_result)
@@ -1139,11 +817,7 @@ async def collect_design_context(shape_id: str) -> dict[str, Any]:
         # vision request timeouts. Use the flattened node list for matching.
         "nodes": nodes[:MAX_CONTEXT_NODES],
         "roots": [],
-        "instruction": (
-            "Mapea regiones visibles de la imagen a estos nodos reales de Penpot. "
-            "Usa id, name, type, path, text y bbox aproximado. No inventes IDs. "
-            "Si no puedes asociar una región visual a una capa, deja affected_layers vacío."
-        ),
+        "purpose": "visual_layer_mapping",
     }
 
 
@@ -1535,7 +1209,7 @@ def make_compact_design_context(design_context: dict[str, Any]) -> dict[str, Any
         "source_errors": design_context.get("source_errors", {}),
         "overview_preview": design_context.get("overview_preview"),
         "nodes": design_context.get("nodes", [])[:MAX_CONTEXT_NODES],
-        "instruction": design_context.get("instruction", ""),
+        "purpose": design_context.get("purpose", "visual_layer_mapping"),
     }
 
 
@@ -1554,28 +1228,21 @@ def build_visual_prompt(
     context: str | None,
     design_context: dict[str, Any] | None = None,
 ) -> str:
-    prompt = VISUAL_VALIDATOR_PROMPT
+    contract_json = json.dumps(
+        load_json_resource("schemas/validator_report_contract.json"),
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
 
-    if context:
-        prompt += (
-            "\n\nContexto adicional del workflow o solicitud original del usuario:\n"
-            f"{context}"
-        )
-
-    if design_context:
-        prompt += (
-            "\n\nInstrucciones estrictas para referencias de capas:\n"
-            "- Cada nodo trae `node_ref`. Usa `node_ref` como referencia primaria.\n"
-            "- Cuando llenes matched_layer o affected_layers, copia exactamente node_ref, id, name, type y path desde DESIGN_CONTEXT_JSON.\n"
-            "- No combines el id de una capa con el name/type/path de otra.\n"
-            "- Si dudas entre dos capas, elige la que coincida mejor por bbox/text/type y baja confidence.\n"
-            "- Si no hay match claro, deja la referencia vacía.\n"
-            "\n\nDESIGN_CONTEXT_JSON:\n"
-            f"{json_for_prompt(design_context)}"
-        )
-
-    return prompt
-
+    return render_skill(
+        "validator.md",
+        {
+            "USER_REQUEST": context or "Valida visualmente la pantalla actual de Penpot para handoff frontend.",
+            "DESIGN_CONTEXT_JSON": json_for_prompt(design_context or {}),
+            "VALIDATOR_REPORT_CONTRACT_JSON": contract_json,
+        },
+    )
 
 def make_mistral_error_report(exc: Exception) -> dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
@@ -1628,10 +1295,7 @@ async def validator_prepare_input(
     user_input = state.get("changeme")
 
     if not user_input:
-        user_input = (
-            "Valida visualmente la pantalla actual de Penpot y genera un reporte "
-            "de handoff frontend en JSON válido."
-        )
+        user_input = ""
 
     return {
         "changeme": user_input,
