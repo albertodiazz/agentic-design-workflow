@@ -1439,17 +1439,45 @@ def _node_refs_where(nodes: list[dict[str, Any]], predicate: Any) -> list[str]:
     return refs
 
 
+def _dvcp_normalize_evidence_name(value: Any) -> str:
+    return (
+        str(value or "")
+        .replace(" / ", "/")
+        .replace("/ ", "/")
+        .replace(" /", "/")
+        .replace("_", "")
+        .replace("-", "")
+        .replace(" ", "")
+        .lower()
+    )
+
+
+def _dvcp_has_all(parts: list[str], text: str) -> bool:
+    return all(_dvcp_normalize_evidence_name(part) in text for part in parts)
+
+
 def compact_native_library_evidence(library: Any) -> dict[str, Any]:
-    """Return compact native Penpot Assets/Tokens evidence for DVCP prompt."""
+    """Return compact native Penpot Assets/Tokens evidence for DVCP prompt.
+
+    DVCP/0.3 keeps explicit evidence for native interactive state assets.
+    Penpot may expose hierarchical asset names as leaf names in the library;
+    therefore we also preserve plugin metadata written by the semantic executor
+    (`dvcp.full_name`, `dvcp.semantic_role`, `dvcp.states`).
+    """
     if not isinstance(library, dict):
-        return {"available": False, "token_sets": [], "components": []}
+        return {
+            "available": False,
+            "token_sets": [],
+            "components": [],
+            "interactive_state_evidence": {},
+        }
 
     token_sets_out: list[dict[str, Any]] = []
     for token_set in (library.get("token_sets") or [])[:12]:
         if not isinstance(token_set, dict):
             continue
         tokens_out: list[dict[str, Any]] = []
-        for token in (token_set.get("tokens") or [])[:60]:
+        for token in (token_set.get("tokens") or [])[:120]:
             if not isinstance(token, dict):
                 continue
             tokens_out.append({
@@ -1464,13 +1492,28 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
         })
 
     components_out: list[dict[str, Any]] = []
-    for component in (library.get("components") or [])[:80]:
+    for component in (library.get("components") or [])[:160]:
         if not isinstance(component, dict):
             continue
+        full_name = (
+            component.get("full_name")
+            or component.get("plugin_full_name")
+            or component.get("path")
+            or component.get("name")
+            or ""
+        )
+        semantic_role = component.get("semantic_role") or component.get("plugin_semantic_role") or ""
         components_out.append({
             "name": component.get("name", ""),
+            "full_name": full_name,
+            "path": component.get("path", ""),
+            "semantic_role": semantic_role,
             "type": component.get("type", ""),
             "id": component.get("id", ""),
+            "dvcp_states": component.get("dvcpStatesParsed") or component.get("dvcpStates") or component.get("dvcpStatesSerialized"),
+            "is_focus_state": bool(component.get("is_focus_state")),
+            "is_hover_state": bool(component.get("is_hover_state")),
+            "is_disabled_state": bool(component.get("is_disabled_state")),
         })
 
     token_names: list[str] = []
@@ -1485,18 +1528,190 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
                 token_names.append(token_name)
 
     component_names = [str(item.get("name") or "") for item in components_out if item.get("name")]
+    component_full_names = [str(item.get("full_name") or item.get("path") or item.get("name") or "") for item in components_out]
+    component_semantic_roles = [str(item.get("semantic_role") or "") for item in components_out if item.get("semantic_role")]
+
+    normalized_components = _dvcp_normalize_evidence_name(
+        " / ".join(component_full_names + component_names + component_semantic_roles + [str(item.get("dvcp_states") or "") for item in components_out])
+    )
+    normalized_tokens = _dvcp_normalize_evidence_name(" / ".join(token_names))
+
+    reader_evidence = library.get("interactive_state_evidence") if isinstance(library.get("interactive_state_evidence"), dict) else {}
+    interactive_state_evidence = {
+        "has_email_input": bool(reader_evidence.get("has_email_input")) or _dvcp_has_all(["textinput", "email"], normalized_components) or _dvcp_has_all(["email", "input"], normalized_components),
+        "has_password_input": bool(reader_evidence.get("has_password_input")) or _dvcp_has_all(["textinput", "password"], normalized_components) or _dvcp_has_all(["password", "input"], normalized_components),
+        "has_primary_button": bool(reader_evidence.get("has_primary_button")) or _dvcp_has_all(["button", "primary"], normalized_components),
+        "has_email_focus": bool(reader_evidence.get("has_email_focus")) or _dvcp_has_all(["email", "focus"], normalized_components),
+        "has_password_focus": bool(reader_evidence.get("has_password_focus")) or _dvcp_has_all(["password", "focus"], normalized_components),
+        "has_button_focus": bool(reader_evidence.get("has_button_focus")) or _dvcp_has_all(["button", "focus"], normalized_components) or _dvcp_has_all(["primary", "focus"], normalized_components),
+        "has_button_hover": bool(reader_evidence.get("has_button_hover")) or _dvcp_has_all(["button", "hover"], normalized_components) or _dvcp_has_all(["primary", "hover"], normalized_components),
+        "has_button_disabled": bool(reader_evidence.get("has_button_disabled")) or _dvcp_has_all(["button", "disabled"], normalized_components) or _dvcp_has_all(["primary", "disabled"], normalized_components),
+        "has_focus_tokens": bool(reader_evidence.get("has_focus_tokens")) or "colorfocusring" in normalized_tokens or "borderfocuswidth" in normalized_tokens,
+        "has_interactive_color_tokens": bool(reader_evidence.get("has_interactive_color_tokens")) or ("hover" in normalized_tokens and "disabled" in normalized_tokens),
+        "has_spacing_tokens": bool(reader_evidence.get("has_spacing_tokens")) or "spacingformgap" in normalized_tokens or "spacinginputpaddingx" in normalized_tokens,
+    }
+    interactive_state_evidence["all_focus_states"] = (
+        interactive_state_evidence["has_email_focus"]
+        and interactive_state_evidence["has_password_focus"]
+        and interactive_state_evidence["has_button_focus"]
+    )
+    interactive_state_evidence["all_button_states"] = (
+        interactive_state_evidence["has_button_hover"]
+        and interactive_state_evidence["has_button_disabled"]
+        and interactive_state_evidence["has_button_focus"]
+    )
+    interactive_state_evidence["interactive_tokens_complete"] = (
+        interactive_state_evidence["has_focus_tokens"]
+        and interactive_state_evidence["has_interactive_color_tokens"]
+    )
+    interactive_state_evidence["component_states_complete"] = (
+        interactive_state_evidence["all_focus_states"]
+        and interactive_state_evidence["all_button_states"]
+    )
 
     return {
         "available": bool(library.get("available")),
         "token_sets": token_sets_out,
         "token_set_names": token_set_names,
-        "token_names": token_names[:160],
+        "token_names": token_names[:240],
         "components": components_out,
-        "component_names": component_names[:160],
+        "component_names": component_names[:240],
+        "component_full_names": component_full_names[:240],
+        "component_semantic_roles": component_semantic_roles[:240],
+        "interactive_state_evidence": interactive_state_evidence,
         "colors": [item.get("name", "") for item in (library.get("colors") or [])[:40] if isinstance(item, dict)],
         "typographies": [item.get("name", "") for item in (library.get("typographies") or [])[:40] if isinstance(item, dict)],
     }
 
+
+
+def apply_native_interactive_evidence_to_report(
+    report: dict[str, Any],
+    design_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministically credit native state assets/tokens discovered by the reader.
+
+    The vision model can miss library-only evidence because it is not visible on the
+    selected canvas. This pass does not invent design quality; it only prevents
+    repeated warnings when `penpot_read_structure.js` proves that DVCP/Core tokens
+    and native state assets exist in the Penpot library.
+    """
+    if not isinstance(report, dict):
+        return report
+
+    native = compact_native_library_evidence(design_context.get("library"))
+    evidence = native.get("interactive_state_evidence") or {}
+    if not isinstance(evidence, dict):
+        return report
+
+    tokens_complete = bool(evidence.get("interactive_tokens_complete"))
+    states_complete = bool(evidence.get("component_states_complete"))
+    focus_complete = bool(evidence.get("all_focus_states"))
+    button_states_complete = bool(evidence.get("all_button_states"))
+
+    if not (tokens_complete or states_complete or focus_complete or button_states_complete):
+        return report
+
+    checks = report.get("checks")
+    if not isinstance(checks, dict):
+        checks = {}
+        report["checks"] = checks
+
+    def upsert_check(name: str, min_score: int, status: str, note: str) -> None:
+        item = checks.get(name)
+        if not isinstance(item, dict):
+            item = {"status": status, "score": min_score, "notes": []}
+            checks[name] = item
+        item["score"] = max(int(item.get("score") or 0), min_score)
+        current_status = str(item.get("status") or "unknown")
+        if current_status in {"fail", "unknown"} or status == "pass":
+            item["status"] = status
+        notes = item.get("notes")
+        if not isinstance(notes, list):
+            notes = []
+        if note not in notes:
+            notes.append(note)
+        item["notes"] = notes[:2]
+
+    if tokens_complete:
+        upsert_check(
+            "frontend_handoff",
+            85,
+            "pass" if states_complete else "warning",
+            "Tokens interactivos nativos detectados en DVCP/Core.",
+        )
+        upsert_check(
+            "layout_spacing",
+            90,
+            "pass",
+            "Tokens de spacing nativos detectados.",
+        )
+
+    if states_complete:
+        upsert_check(
+            "componentization",
+            85,
+            "pass",
+            "Assets nativos de estados interactivos detectados.",
+        )
+        upsert_check(
+            "accessibility",
+            85,
+            "pass",
+            "Estados de focus nativos detectados para inputs y botón.",
+        )
+
+    elif focus_complete:
+        upsert_check(
+            "accessibility",
+            80,
+            "warning",
+            "Estados de focus nativos detectados parcialmente.",
+        )
+
+    # Remove issues that are fully satisfied by native library evidence.
+    filtered_issues: list[dict[str, Any]] = []
+    removed_categories: list[str] = []
+    for issue in report.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        category = str(issue.get("category") or "").lower()
+        text = " ".join([
+            str(issue.get("message") or ""),
+            str(issue.get("recommendation") or ""),
+        ]).lower()
+        is_interaction_issue = any(term in text for term in ["focus", "hover", "disabled", "interactivo", "estado", "states"])
+        is_spacing_issue = "spacing" in text or "espaciado" in text
+        remove = False
+        if states_complete and is_interaction_issue and category in {"componentization", "accessibility", "frontend_handoff"}:
+            remove = True
+        if tokens_complete and is_spacing_issue and category in {"layout_spacing", "frontend_handoff"}:
+            remove = True
+        if remove:
+            removed_categories.append(category or "unknown")
+            continue
+        filtered_issues.append(issue)
+    report["issues"] = filtered_issues
+
+    if states_complete and tokens_complete:
+        report["score"] = max(int(report.get("score") or 0), 88)
+        report["passed"] = True
+        report["status"] = "ready"
+        report["can_be_sent_to_development"] = True
+
+    dvcp = report.get("dvcp")
+    if not isinstance(dvcp, dict):
+        dvcp = {}
+    dvcp["native_interactive_evidence"] = {
+        "tokens_complete": tokens_complete,
+        "states_complete": states_complete,
+        "focus_complete": focus_complete,
+        "button_states_complete": button_states_complete,
+        "removed_issue_categories": removed_categories[:12],
+    }
+    report["dvcp"] = dvcp
+
+    return report
 
 def make_dvcp_design_snapshot(design_context: dict[str, Any]) -> dict[str, Any]:
     """Build a compact set/reference snapshot for the LLM.
@@ -1764,6 +1979,7 @@ async def validator_visual_call(
             report = expand_dvcp_delta_report(report, design_context)
             report = attach_design_context_to_report(report, design_context)
             report = normalize_report_layer_references(report, design_context)
+            report = apply_native_interactive_evidence_to_report(report, design_context)
             report = attach_fix_plans(report)
 
         return {

@@ -147,6 +147,49 @@ function serializeShape(shape, depth, path) {
 }
 
 
+function normalizeEvidenceName(value) {
+  return String(value || "")
+    .replace(/\s*\/\s*/g, "/")
+    .replace(/[_\s-]+/g, "")
+    .toLowerCase();
+}
+
+function readPluginData(item, key) {
+  try {
+    if (item && typeof item.getPluginData === "function") {
+      var value = item.getPluginData(key);
+      if (value !== undefined && value !== null && String(value) !== "") return String(value);
+    }
+  } catch (err) {}
+  return "";
+}
+
+function parseJsonOrNull(value) {
+  try {
+    if (!value) return null;
+    return JSON.parse(String(value));
+  } catch (err) {
+    return null;
+  }
+}
+
+function deriveComponentEvidenceFields(entry) {
+  var candidateNames = [entry.full_name, entry.path, entry.name, entry.plugin_full_name].filter(Boolean);
+  var joined = candidateNames.join(" /");
+  var normalized = normalizeEvidenceName(joined);
+  var semanticRole = normalizeEvidenceName(entry.semantic_role || entry.plugin_semantic_role || "");
+
+  entry.normalized_name = normalizeEvidenceName(entry.full_name || entry.path || entry.name);
+  entry.evidence_aliases = candidateNames;
+  entry.is_text_input = /textinput/.test(normalized) || /textinput/.test(semanticRole) || /input/.test(semanticRole);
+  entry.is_button = /button/.test(normalized) || /button/.test(semanticRole);
+  entry.is_focus_state = /focus/.test(normalized) || /focus/.test(semanticRole);
+  entry.is_hover_state = /hover/.test(normalized) || /hover/.test(semanticRole);
+  entry.is_disabled_state = /disabled/.test(normalized) || /disabled/.test(semanticRole);
+
+  return entry;
+}
+
 function readLibraryItems(collection, maxItems) {
   var out = [];
   var candidates = [collection, collection && collection.items, collection && collection.values, collection && collection.components, collection && collection.tokens, collection && collection.sets];
@@ -155,21 +198,29 @@ function readLibraryItems(collection, maxItems) {
     for (var i = 0; i < arr.length && out.length < (maxItems || 80); i++) {
       var item = arr[i];
       if (!item) continue;
+
+      var pluginFullName = readPluginData(item, "dvcp.full_name");
+      var pluginSemanticRole = readPluginData(item, "dvcp.semantic_role");
+      var pluginStatesSerialized = readPluginData(item, "dvcp.states");
+      var pluginStates = parseJsonOrNull(pluginStatesSerialized);
+
       var entry = {
         id: item.id ? String(item.id) : "",
         name: item.name ? String(item.name) : "",
         path: item.path ? String(item.path) : "",
         type: item.type ? String(item.type) : "",
         value: item.value !== undefined ? safePlain(item.value, 6) : null,
-        dvcpStates: item.dvcpStates !== undefined ? safePlain(item.dvcpStates, 12) : null
+        plugin_full_name: pluginFullName,
+        plugin_semantic_role: pluginSemanticRole,
+        full_name: pluginFullName || (item.fullName ? String(item.fullName) : "") || (item.path ? String(item.path) : "") || (item.name ? String(item.name) : ""),
+        semantic_role: pluginSemanticRole || (item.dvcpSemanticRole ? String(item.dvcpSemanticRole) : ""),
+        dvcpStates: item.dvcpStates !== undefined ? safePlain(item.dvcpStates, 12) : null,
+        dvcpStatesSerialized: pluginStatesSerialized,
+        dvcpStatesParsed: pluginStates ? safePlain(pluginStates, 20) : null
       };
-      try {
-        if (typeof item.getPluginData === "function") {
-          var states = item.getPluginData("dvcp.states");
-          if (states) entry.dvcpStatesSerialized = String(states);
-        }
-      } catch (errState) {}
-      if (entry.name || entry.id || entry.type) out.push(entry);
+
+      deriveComponentEvidenceFields(entry);
+      if (entry.name || entry.id || entry.type || entry.full_name) out.push(entry);
     }
   }
   return out;
@@ -231,6 +282,40 @@ function readLibrarySummary() {
     }
   }
   summary.component_names = summary.components.map(function (component) { return String(component.name || ""); }).filter(Boolean);
+  summary.component_full_names = summary.components.map(function (component) { return String(component.full_name || component.path || component.name || ""); }).filter(Boolean);
+  summary.component_semantic_roles = summary.components.map(function (component) { return String(component.semantic_role || ""); }).filter(Boolean);
+
+  var allComponentText = summary.components.map(function (component) {
+    return [component.full_name, component.path, component.name, component.semantic_role, component.dvcpStatesSerialized].join(" /");
+  }).join(" /");
+  var normalizedComponents = normalizeEvidenceName(allComponentText);
+  var normalizedTokens = normalizeEvidenceName(summary.token_names.join(" /"));
+
+  function hasAll(parts, text) {
+    for (var i = 0; i < parts.length; i++) {
+      if (text.indexOf(normalizeEvidenceName(parts[i])) < 0) return false;
+    }
+    return true;
+  }
+
+  summary.interactive_state_evidence = {
+    has_email_input: hasAll(["textinput", "email"], normalizedComponents) || hasAll(["email", "input"], normalizedComponents),
+    has_password_input: hasAll(["textinput", "password"], normalizedComponents) || hasAll(["password", "input"], normalizedComponents),
+    has_primary_button: hasAll(["button", "primary"], normalizedComponents) || normalizedComponents.indexOf("primary") >= 0,
+    has_email_focus: hasAll(["email", "focus"], normalizedComponents),
+    has_password_focus: hasAll(["password", "focus"], normalizedComponents),
+    has_button_focus: hasAll(["button", "focus"], normalizedComponents) || hasAll(["primary", "focus"], normalizedComponents),
+    has_button_hover: hasAll(["button", "hover"], normalizedComponents) || hasAll(["primary", "hover"], normalizedComponents),
+    has_button_disabled: hasAll(["button", "disabled"], normalizedComponents) || hasAll(["primary", "disabled"], normalizedComponents),
+    has_focus_tokens: normalizedTokens.indexOf("color.focus.ring") >= 0 || normalizedTokens.indexOf("colorfocusring") >= 0,
+    has_interactive_color_tokens: (normalizedTokens.indexOf("hover") >= 0 && normalizedTokens.indexOf("disabled") >= 0),
+    has_spacing_tokens: normalizedTokens.indexOf("spacing.form.gap") >= 0 || normalizedTokens.indexOf("spacingformgap") >= 0,
+    normalized_component_text: normalizedComponents.slice(0, 2000),
+    normalized_token_text: normalizedTokens.slice(0, 2000)
+  };
+  summary.interactive_state_evidence.all_focus_states = summary.interactive_state_evidence.has_email_focus && summary.interactive_state_evidence.has_password_focus && summary.interactive_state_evidence.has_button_focus;
+  summary.interactive_state_evidence.all_button_states = summary.interactive_state_evidence.has_button_hover && summary.interactive_state_evidence.has_button_disabled && summary.interactive_state_evidence.has_button_focus;
+  summary.interactive_state_evidence.interactive_tokens_complete = summary.interactive_state_evidence.has_focus_tokens && summary.interactive_state_evidence.has_interactive_color_tokens;
 
   return summary;
 }

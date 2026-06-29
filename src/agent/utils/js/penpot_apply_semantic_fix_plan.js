@@ -684,12 +684,32 @@ function findNativeComponent(componentName) {
   return null;
 }
 
-function createNativeComponent(componentName, shapes) {
+function writeComponentEvidence(component, componentName, semanticRole) {
+  if (!component) return;
+  var name = String(componentName || "");
+  var role = String(semanticRole || "");
+
+  try { component.dvcpFullName = name; } catch (err0) {}
+  try { component.dvcpSemanticRole = role; } catch (err1) {}
+  try { component.fullName = name; } catch (err2) {}
+
+  try {
+    if (typeof component.setPluginData === "function") {
+      component.setPluginData("dvcp.full_name", name);
+      component.setPluginData("dvcp.semantic_role", role);
+    }
+  } catch (err3) {}
+}
+
+function createNativeComponent(componentName, shapes, semanticRole) {
   var lib = getLocalLibrary();
   if (!lib) return { component: null, error: "native_library_not_available" };
 
   var existing = findNativeComponent(componentName);
-  if (existing) return { component: existing, existed: true, error: null };
+  if (existing) {
+    writeComponentEvidence(existing, componentName, semanticRole);
+    return { component: existing, existed: true, error: null };
+  }
 
   var attempts = [
     function () { return lib.createComponent(shapes); },
@@ -719,13 +739,15 @@ function createNativeComponent(componentName, shapes) {
     try { component.setName(componentName); } catch (err2) {}
   }
 
+  writeComponentEvidence(component, componentName, semanticRole);
+
   return { component: component, existed: false, error: null };
 }
 
 function applyCreateNativeComponent(item, shapesById) {
   var shapes = findShapesByChildren(item.children || [], shapesById);
   var name = String(item.component_name || item.group_name || item.name || "DVCP/Component");
-  var result = createNativeComponent(name, shapes);
+  var result = createNativeComponent(name, shapes, item.semantic_role || "");
 
   if (!result.component && item.fallback_annotations === true) {
     var fallbackItem = {
@@ -775,6 +797,8 @@ function applyNativeComponentStateMetadata(item) {
     }
     return { action: item.action, name: name, applied: false, native: false, error: "component_not_found" };
   }
+
+  writeComponentEvidence(component, name, item.semantic_role || "component_state_metadata");
 
   try {
     component.dvcpStates = states;
