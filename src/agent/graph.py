@@ -225,6 +225,8 @@ class OutputState(TypedDict, total=False):
     auto_fix_event: dict[str, Any] | None
     auto_fix_verification: dict[str, Any] | None
 
+    semantic_auto_fix_result: dict[str, Any] | None
+
 
 class OverallState(MessagesState, total=False):
     changeme: NotRequired[str]
@@ -253,7 +255,9 @@ class OverallState(MessagesState, total=False):
     last_auto_fix_plan: NotRequired[list[dict[str, Any]]]
     last_canvas_fix_targets: NotRequired[list[dict[str, Any]]]
     last_canvas_fix_plan: NotRequired[list[dict[str, Any]]]
+    last_semantic_fix_plan: NotRequired[list[dict[str, Any]]]
     canvas_auto_fix_result: NotRequired[dict[str, Any]]
+    semantic_auto_fix_result: NotRequired[dict[str, Any]]
     post_fix_validation_mode: NotRequired[str | None]
     auto_fix_verified: NotRequired[bool]
     auto_fix_event: NotRequired[dict[str, Any] | None]
@@ -548,6 +552,38 @@ def build_apply_canvas_fix_script(canvas_plan: list[dict[str, Any]]) -> str:
         "__CANVAS_FIX_PLAN_JSON__",
         plan_json,
     )
+
+
+def build_apply_semantic_fix_script(semantic_plan: list[dict[str, Any]]) -> str:
+    """Render the Penpot Plugin API script that applies semantic/token edits."""
+    plan_json = json.dumps(semantic_plan, ensure_ascii=False, default=str)
+    return load_js("penpot_apply_semantic_fix_plan.js").replace(
+        "__SEMANTIC_FIX_PLAN_JSON__",
+        plan_json,
+    )
+
+
+def semantic_auto_fix_enabled() -> bool:
+    """Semantic fixes create helper layers/groups, so they can be disabled explicitly.
+
+    Default: enabled whenever canvas auto-fix is enabled.
+    Set PENPOT_ENABLE_SEMANTIC_AUTO_FIX=0 to disable.
+    """
+    raw = os.getenv("PENPOT_ENABLE_SEMANTIC_AUTO_FIX")
+    if raw is None:
+        return canvas_auto_fix_enabled()
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def semantic_fallback_annotations_enabled() -> bool:
+    """Allow visible DVCP annotations only as an explicit fallback/debug mode.
+
+    Native Penpot assets/tokens are the preferred semantic representation.
+    Set PENPOT_SEMANTIC_FALLBACK_ANNOTATIONS=1 to create visible helper panels
+    when native APIs are unavailable or during debugging.
+    """
+    raw = os.getenv("PENPOT_SEMANTIC_FALLBACK_ANNOTATIONS", "0")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -906,6 +942,258 @@ def build_deterministic_canvas_fix_plan(
 
     return plan
 
+
+def _semantic_issue_present(validation_report: Any) -> bool:
+    if not isinstance(validation_report, dict):
+        return False
+    categories = {
+        "componentization",
+        "accessibility",
+        "frontend_handoff",
+        "design_tokens",
+        "handoff",
+    }
+    for issue in validation_report.get("issues", []) or []:
+        if isinstance(issue, dict) and str(issue.get("category") or "") in categories:
+            return True
+    return False
+
+
+def _semantic_child(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "node_ref": item.get("node_ref"),
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "type": item.get("type"),
+    }
+
+
+def _bbox_union(items: list[dict[str, Any]]) -> dict[str, int]:
+    boxes = [_bbox(item) for item in items if isinstance(item, dict)]
+    if not boxes:
+        return {"x": 0, "y": 0, "width": 0, "height": 0}
+    min_x = min(box["x"] for box in boxes)
+    min_y = min(box["y"] for box in boxes)
+    max_x = max(box["x"] + box["width"] for box in boxes)
+    max_y = max(box["y"] + box["height"] for box in boxes)
+    return {
+        "x": _canonical_number(min_x),
+        "y": _canonical_number(min_y),
+        "width": _canonical_number(max_x - min_x),
+        "height": _canonical_number(max_y - min_y),
+    }
+
+
+def build_deterministic_semantic_fix_plan(
+    validation_report: Any,
+    known_targets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build native Penpot semantic/tokenization fixes.
+
+    Preferred representation:
+    - native Penpot token set in Assets/Tokens;
+    - native Penpot components/assets created from known target layers;
+    - token bindings applied to existing layers.
+
+    Visible DVCP annotation panels are now an explicit fallback/debug option,
+    because they contaminate the main canvas. Enable them with:
+
+        PENPOT_SEMANTIC_FALLBACK_ANNOTATIONS=1
+    """
+    if not semantic_auto_fix_enabled():
+        return []
+
+    if not isinstance(validation_report, dict) or not known_targets:
+        return []
+
+    if not _semantic_issue_present(validation_report):
+        return []
+
+    targets = [item for item in known_targets if isinstance(item, dict) and item.get("id")]
+    if not targets:
+        return []
+
+    fallback_annotations = semantic_fallback_annotations_enabled()
+
+    def kind(item: dict[str, Any]) -> str:
+        return " ".join([
+            _role(item),
+            _region(item),
+            _target_name(item).lower(),
+        ])
+
+    card = next((t for t in targets if "card" in kind(t) or "container" in kind(t)), None)
+    title = next((t for t in targets if "title" in kind(t) or "heading" in kind(t)), None)
+    email_bg = next((t for t in targets if "email" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
+    email_label = next((t for t in targets if "email" in kind(t) and _is_text(t)), None)
+    password_bg = next((t for t in targets if "password" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
+    password_label = next((t for t in targets if "password" in kind(t) and _is_text(t)), None)
+    button_bg = next((t for t in targets if "button" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
+    button_text = next((t for t in targets if "button" in kind(t) and _is_text(t)), None)
+
+    plan: list[dict[str, Any]] = []
+
+    token_specs = [
+        {"name": "color.primary", "type": "color", "value": "#2563EB"},
+        {"name": "color.primary.hover", "type": "color", "value": "#1D4ED8"},
+        {"name": "color.text.default", "type": "color", "value": "#111827"},
+        {"name": "color.text.inverse", "type": "color", "value": "#FFFFFF"},
+        {"name": "color.border.input", "type": "color", "value": "#94A3B8"},
+        {"name": "color.surface.input", "type": "color", "value": "#FFFFFF"},
+        {"name": "spacing.12", "type": "spacing", "value": "12px"},
+        {"name": "spacing.16", "type": "spacing", "value": "16px"},
+        {"name": "spacing.24", "type": "spacing", "value": "24px"},
+        {"name": "typography.heading.size", "type": "fontSizes", "value": "24px"},
+        {"name": "typography.label.size", "type": "fontSizes", "value": "14px"},
+        {"name": "typography.button.size", "type": "fontSizes", "value": "16px"},
+        {"name": "border.input.width", "type": "borderWidth", "value": "1px"},
+        {"name": "radius.input", "type": "borderRadius", "value": "6px"},
+    ]
+
+    plan.append({
+        "action": "ensure_native_tokens",
+        "set_name": "DVCP/Core",
+        "tokens": token_specs,
+        "fallback_annotations": fallback_annotations,
+        "reason": "Create native Penpot tokens for colors, spacing, typography and borders.",
+        "safety": "safe_native_token_library_write",
+    })
+
+    assignments: list[dict[str, Any]] = []
+
+    def add_token_assignment(target: dict[str, Any] | None, token: str, properties: list[str], reason: str) -> None:
+        if not isinstance(target, dict) or not target.get("id"):
+            return
+        assignments.append({
+            "id": target.get("id"),
+            "node_ref": target.get("node_ref"),
+            "name": target.get("name"),
+            "token": token,
+            "properties": properties,
+            "reason": reason,
+        })
+
+    add_token_assignment(title, "typography.heading.size", ["fontSize"], "Bind title typography size token.")
+    add_token_assignment(title, "color.text.default", ["fill"], "Bind title text color token.")
+    add_token_assignment(email_label, "typography.label.size", ["fontSize"], "Bind email label typography token.")
+    add_token_assignment(email_label, "color.text.default", ["fill"], "Bind email label color token.")
+    add_token_assignment(password_label, "typography.label.size", ["fontSize"], "Bind password label typography token.")
+    add_token_assignment(password_label, "color.text.default", ["fill"], "Bind password label color token.")
+    add_token_assignment(button_text, "typography.button.size", ["fontSize"], "Bind button text typography token.")
+    add_token_assignment(button_text, "color.text.inverse", ["fill"], "Bind button text inverse color token.")
+    for input_bg in [email_bg, password_bg]:
+        add_token_assignment(input_bg, "color.surface.input", ["fill"], "Bind input surface token.")
+        add_token_assignment(input_bg, "color.border.input", ["stroke"], "Bind input border token.")
+        add_token_assignment(input_bg, "border.input.width", ["strokeWidth"], "Bind input border width token.")
+        add_token_assignment(input_bg, "radius.input", ["borderRadius"], "Bind input radius token.")
+    add_token_assignment(button_bg, "color.primary", ["fill"], "Bind primary button fill token.")
+    add_token_assignment(button_bg, "color.primary.hover", ["stroke"], "Bind primary button stroke/hover token.")
+
+    if assignments:
+        plan.append({
+            "action": "apply_native_tokens",
+            "set_name": "DVCP/Core",
+            "assignments": assignments,
+            "fallback_annotations": fallback_annotations,
+            "reason": "Bind native tokens to existing known target layers.",
+            "safety": "safe_native_token_bindings_known_targets",
+        })
+
+    def native_component(name: str, role: str, children: list[dict[str, Any]], reason: str) -> None:
+        clean_children = [c for c in children if isinstance(c, dict) and c.get("id")]
+        if len(clean_children) < 2:
+            return
+        plan.append({
+            "action": "create_native_component",
+            "component_name": name,
+            "semantic_role": role,
+            "children": [_semantic_child(c) for c in clean_children],
+            "bbox": _bbox_union(clean_children),
+            "fallback_annotations": fallback_annotations,
+            "reason": reason,
+            "safety": "safe_native_component_from_known_targets",
+        })
+
+    native_component(
+        "TextInput/Email",
+        "text_input_component",
+        [email_bg, email_label],
+        "Create native Penpot asset/component for email input.",
+    )
+    native_component(
+        "TextInput/Password",
+        "text_input_component",
+        [password_bg, password_label],
+        "Create native Penpot asset/component for password input.",
+    )
+    native_component(
+        "Button/Primary",
+        "button_component",
+        [button_bg, button_text],
+        "Create native Penpot asset/component for primary login button.",
+    )
+
+    if card and title and button_bg:
+        children = [item for item in [card, title, email_bg, email_label, password_bg, password_label, button_bg, button_text] if item]
+        native_component(
+            "Login/Card",
+            "login_card_component",
+            children,
+            "Create native Penpot asset/component for the full login card pattern.",
+        )
+
+    # Store interaction semantics as native token metadata/spec where possible.
+    # Visible state examples are now a fallback/debug concern, not the primary path.
+    if button_bg:
+        plan.append({
+            "action": "ensure_native_component_state_metadata",
+            "component_name": "Button/Primary",
+            "states": [
+                {"name": "default", "fill_token": "color.primary", "text_token": "color.text.inverse"},
+                {"name": "hover", "fill_token": "color.primary.hover", "text_token": "color.text.inverse"},
+                {"name": "disabled", "fill": "#CBD5E1", "text": "#64748B"},
+                {"name": "focus", "stroke_token": "color.primary.hover", "stroke_width": 2},
+            ],
+            "fallback_annotations": fallback_annotations,
+            "reason": "Document interaction states as native component metadata when supported.",
+            "safety": "safe_native_component_metadata",
+        })
+
+    if fallback_annotations:
+        cb = _bbox(card) if card else _bbox_union(targets)
+        panel_x = _canonical_number(cb["x"] + cb["width"] + 80)
+        panel_y = _canonical_number(cb["y"])
+        plan.append({
+            "action": "create_design_tokens_annotation",
+            "name": "DesignTokensFallback",
+            "semantic_role": "design_tokens_fallback",
+            "bbox": {"x": panel_x, "y": panel_y, "width": 300, "height": 220},
+            "tokens": {t["name"]: t["value"] for t in token_specs},
+            "reason": "Fallback only: visible token documentation when native tokens are unavailable.",
+            "safety": "safe_semantic_fix_create_helper_layer",
+        })
+        plan.append({
+            "action": "create_handoff_annotation",
+            "name": "HandoffNotesFallback",
+            "semantic_role": "frontend_handoff_notes_fallback",
+            "bbox": {"x": panel_x, "y": panel_y + 248, "width": 360, "height": 220},
+            "text": "HandoffNotes\nNative target: Penpot Assets + Tokens\nComponents: TextInput/Email, TextInput/Password, Button/Primary, Login/Card\nStates: default, hover, focus, disabled\nAccessibility: labels grouped with inputs; focus state documented.",
+            "reason": "Fallback only: visible handoff documentation when native assets/tokens are unavailable.",
+            "safety": "safe_semantic_fix_create_helper_layer",
+        })
+        plan.append({
+            "action": "create_component_index_annotation",
+            "name": "ComponentIndexFallback",
+            "semantic_role": "component_index_fallback",
+            "bbox": {"x": panel_x, "y": panel_y + 496, "width": 360, "height": 160},
+            "components": ["TextInput/Email", "TextInput/Password", "Button/Primary", "Login/Card", "DVCP/Core"],
+            "reason": "Fallback only: visible index for validator/handoff.",
+            "safety": "safe_semantic_fix_create_helper_layer",
+        })
+
+    return plan
+
+
 def build_auto_fix_event(
     *,
     verification: dict[str, Any],
@@ -968,7 +1256,9 @@ async def prepare_input(
         "last_auto_fix_plan": [],
         "last_canvas_fix_targets": [],
         "last_canvas_fix_plan": [],
+        "last_semantic_fix_plan": [],
         "canvas_auto_fix_result": None,
+        "semantic_auto_fix_result": None,
         "post_fix_validation_mode": None,
         "auto_fix_verified": False,
         "auto_fix_event": None,
@@ -1296,11 +1586,12 @@ async def fix_design(
         rename_event["rename_status"] = "not_needed"
 
         canvas_fix_plan = build_deterministic_canvas_fix_plan(validation_report, known_targets)
+        semantic_fix_plan = build_deterministic_semantic_fix_plan(validation_report, known_targets)
 
-        if not canvas_fix_plan:
+        if not canvas_fix_plan and not semantic_fix_plan:
             message = (
-                "Canvas auto-fix omitido: hay known_targets, pero no se pudo "
-                "generar canvas_fix_plan determinístico ejecutable."
+                "Auto-fix omitido: hay known_targets, pero no se pudo generar "
+                "canvas_fix_plan ni semantic_fix_plan determinístico ejecutable."
             )
             return {
                 "messages": [AIMessage(content=message)],
@@ -1313,7 +1604,8 @@ async def fix_design(
             "last_auto_fix_plan": [],
             "last_canvas_fix_targets": known_targets,
             "last_canvas_fix_plan": canvas_fix_plan,
-            "post_fix_validation_mode": "canvas_fix_pending",
+            "last_semantic_fix_plan": semantic_fix_plan,
+            "post_fix_validation_mode": "canvas_fix_pending" if canvas_fix_plan else "semantic_fix_pending",
             "auto_fix_verified": True,
             "auto_fix_event": rename_event,
             "auto_fix_verification": rename_verification,
@@ -1530,18 +1822,24 @@ async def verify_auto_fix_plan_applied(
                 known_targets,
             )
 
-            if canvas_fix_plan:
+            semantic_fix_plan = build_deterministic_semantic_fix_plan(
+                state["validation_report"],
+                known_targets,
+            )
+
+            if canvas_fix_plan or semantic_fix_plan:
                 return {
                     "auto_fix_verified": all_applied,
                     "auto_fix_event": event,
                     "auto_fix_verification": verification,
                     "last_canvas_fix_targets": known_targets,
                     "last_canvas_fix_plan": canvas_fix_plan,
-                    "post_fix_validation_mode": "canvas_fix_pending",
+                    "last_semantic_fix_plan": semantic_fix_plan,
+                    "post_fix_validation_mode": "canvas_fix_pending" if canvas_fix_plan else "semantic_fix_pending",
                     "response": None,
                 }
 
-            response += " Canvas auto-fix omitido: no se generó canvas_fix_plan determinístico."
+            response += " Canvas/semantic auto-fix omitido: no se generó plan determinístico."
 
         response += (
             f" Canvas auto-fix omitido: no hay known_targets con "
@@ -1616,9 +1914,79 @@ async def apply_canvas_fix_plan_deterministic(
             "results": [],
         }
 
+    semantic_fix_plan = state.get("last_semantic_fix_plan", [])
+    has_semantic_plan = isinstance(semantic_fix_plan, list) and bool(semantic_fix_plan)
+
     return {
         "canvas_auto_fix_result": {
             "type": "canvas_apply_result",
+            **application,
+        },
+        "post_fix_validation_mode": "semantic_fix_pending" if has_semantic_plan else "canvas_auto_fix_unverified",
+        "response": None,
+    }
+
+
+async def apply_semantic_fix_plan_deterministic(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """Apply semantic/tokenization fixes through Penpot execute_code.
+
+    This phase may create helper layers, annotations, state samples or groups.
+    It still requires a fresh validate_only run for scoring.
+    """
+    semantic_fix_plan = state.get("last_semantic_fix_plan", [])
+
+    if not isinstance(semantic_fix_plan, list) or not semantic_fix_plan:
+        return {
+            "semantic_auto_fix_result": {
+                "all_applied": False,
+                "error": "missing_semantic_fix_plan",
+                "checked_count": 0,
+                "applied_count": 0,
+                "failed_count": 0,
+                "results": [],
+            },
+            "post_fix_validation_mode": "canvas_auto_fix_unverified",
+            "response": "No hay semantic_fix_plan determinístico para aplicar.",
+        }
+
+    await get_builder_tools()
+    execute_code = _builder_tools_by_name.get("execute_code")
+
+    if execute_code is None:
+        return {
+            "semantic_auto_fix_result": {
+                "all_applied": False,
+                "error": "execute_code_not_available",
+                "checked_count": len(semantic_fix_plan),
+                "applied_count": 0,
+                "failed_count": len(semantic_fix_plan),
+                "results": [],
+            },
+            "post_fix_validation_mode": "canvas_auto_fix_unverified",
+            "response": "No se pudo aplicar semantic_fix_plan porque execute_code no está disponible.",
+        }
+
+    script = build_apply_semantic_fix_script(semantic_fix_plan)
+
+    try:
+        raw_result = await execute_code.ainvoke({"code": script})
+        application = parse_tool_json_result(raw_result)
+    except Exception as exc:
+        application = {
+            "all_applied": False,
+            "error": repr(exc),
+            "checked_count": len(semantic_fix_plan),
+            "applied_count": 0,
+            "failed_count": len(semantic_fix_plan),
+            "results": [],
+        }
+
+    return {
+        "semantic_auto_fix_result": {
+            "type": "semantic_apply_result",
             **application,
         },
         "post_fix_validation_mode": "canvas_auto_fix_unverified",
@@ -1642,6 +2010,8 @@ async def record_canvas_auto_fix_event(
     known_targets = state.get("last_canvas_fix_targets", [])
     canvas_fix_plan = state.get("last_canvas_fix_plan", [])
     canvas_result = state.get("canvas_auto_fix_result")
+    semantic_fix_plan = state.get("last_semantic_fix_plan", [])
+    semantic_result = state.get("semantic_auto_fix_result")
     rename_event = state.get("auto_fix_event")
 
     if isinstance(canvas_result, dict) and canvas_result.get("error"):
@@ -1664,14 +2034,16 @@ async def record_canvas_auto_fix_event(
         "canvas_fix_plan_count": len(canvas_fix_plan) if isinstance(canvas_fix_plan, list) else 0,
         "canvas_fix_plan": canvas_fix_plan if isinstance(canvas_fix_plan, list) else [],
         "canvas_apply_result": canvas_result if isinstance(canvas_result, dict) else None,
+        "semantic_fix_plan_count": len(semantic_fix_plan) if isinstance(semantic_fix_plan, list) else 0,
+        "semantic_fix_plan": semantic_fix_plan if isinstance(semantic_fix_plan, list) else [],
+        "semantic_apply_result": semantic_result if isinstance(semantic_result, dict) else None,
         "rename_verification_event": rename_event,
         "message": (
-            "Canvas auto-fix mode ran after rename_layer fixes were "
+            "Canvas/semantic auto-fix mode ran after rename_layer fixes were "
             "structurally verified, or after rename_phase=no_op when no rename "
-            "was needed. The builder was allowed to modify only "
-            "known targets mapped by the validator with sufficient confidence. "
-            "No deterministic visual/layout verification was performed. Run "
-            "validate_only to score the updated design."
+            "was needed. The executor was allowed to modify known targets and "
+            "create bounded semantic/token helper artifacts for handoff. "
+            "Run validate_only to score the updated design."
         ),
         "score_before_fix": (
             validation_report.get("score") if isinstance(validation_report, dict) else None
@@ -1687,14 +2059,15 @@ async def record_canvas_auto_fix_event(
         "auto_fix_verification": {
             "all_applied": None,
             "verification_type": "canvas_auto_fix_unverified",
-            "reason": "known-target canvas changes require a fresh validate_only run",
+            "reason": "known-target canvas/semantic changes require a fresh validate_only run",
             "canvas_apply_result": canvas_result if isinstance(canvas_result, dict) else None,
+            "semantic_apply_result": semantic_result if isinstance(semantic_result, dict) else None,
         },
         "post_fix_validation_mode": None,
         "response": (
-            "Canvas auto-fix ejecutado en modo ampliado y limitado a known_targets. "
-            "No se hizo una segunda validación visual automática; corre validate_only "
-            "para obtener un nuevo score del diseño actualizado."
+            "Canvas/semantic auto-fix ejecutado en modo ampliado. "
+            "Se aplicaron cambios visuales y artefactos semánticos/tokens cuando existía plan. "
+            "Corre validate_only para obtener un nuevo score del diseño actualizado."
         ),
     }
 
@@ -1716,7 +2089,7 @@ def route_after_prepare(
 
 def should_continue_after_llm(
     state: OverallState,
-) -> Literal["tool_node", "run_validator", "verify_auto_fix_plan_applied", "apply_canvas_fix_plan_deterministic", "record_canvas_auto_fix_event", "__end__"]:
+) -> Literal["tool_node", "run_validator", "verify_auto_fix_plan_applied", "apply_canvas_fix_plan_deterministic", "apply_semantic_fix_plan_deterministic", "record_canvas_auto_fix_event", "__end__"]:
     if state.get("skip_validation"):
         return END
 
@@ -1738,6 +2111,9 @@ def should_continue_after_llm(
     if post_fix_mode == "canvas_fix_pending":
         return "apply_canvas_fix_plan_deterministic"
 
+    if post_fix_mode == "semantic_fix_pending":
+        return "apply_semantic_fix_plan_deterministic"
+
     if post_fix_mode == "canvas_auto_fix_unverified":
         return "record_canvas_auto_fix_event"
 
@@ -1751,11 +2127,14 @@ def should_continue_after_llm(
 
 def route_after_fix_design(
     state: OverallState,
-) -> Literal["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", "__end__"]:
+) -> Literal["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", "apply_semantic_fix_plan_deterministic", "__end__"]:
     post_fix_mode = state.get("post_fix_validation_mode")
 
     if post_fix_mode == "canvas_fix_pending":
         return "apply_canvas_fix_plan_deterministic"
+
+    if post_fix_mode == "semantic_fix_pending":
+        return "apply_semantic_fix_plan_deterministic"
 
     if post_fix_mode in {"structure_only", "structure_then_canvas"}:
         return "apply_auto_fix_plan_deterministic"
@@ -1765,9 +2144,12 @@ def route_after_fix_design(
 
 def route_after_auto_fix_verification(
     state: OverallState,
-) -> Literal["apply_canvas_fix_plan_deterministic", "__end__"]:
+) -> Literal["apply_canvas_fix_plan_deterministic", "apply_semantic_fix_plan_deterministic", "__end__"]:
     if state.get("post_fix_validation_mode") == "canvas_fix_pending":
         return "apply_canvas_fix_plan_deterministic"
+
+    if state.get("post_fix_validation_mode") == "semantic_fix_pending":
+        return "apply_semantic_fix_plan_deterministic"
 
     return END
 
@@ -1814,6 +2196,7 @@ agent_builder.add_node("fix_design", fix_design)
 agent_builder.add_node("apply_auto_fix_plan_deterministic", apply_auto_fix_plan_deterministic)
 agent_builder.add_node("verify_auto_fix_plan_applied", verify_auto_fix_plan_applied)
 agent_builder.add_node("apply_canvas_fix_plan_deterministic", apply_canvas_fix_plan_deterministic)
+agent_builder.add_node("apply_semantic_fix_plan_deterministic", apply_semantic_fix_plan_deterministic)
 agent_builder.add_node("record_canvas_auto_fix_event", record_canvas_auto_fix_event)
 
 agent_builder.add_edge(START, "prepare_input")
@@ -1832,6 +2215,7 @@ agent_builder.add_conditional_edges(
         "run_validator",
         "verify_auto_fix_plan_applied",
         "apply_canvas_fix_plan_deterministic",
+        "apply_semantic_fix_plan_deterministic",
         "record_canvas_auto_fix_event",
         END,
     ],
@@ -1848,15 +2232,20 @@ agent_builder.add_conditional_edges(
 agent_builder.add_conditional_edges(
     "fix_design",
     route_after_fix_design,
-    ["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", END],
+    ["apply_auto_fix_plan_deterministic", "apply_canvas_fix_plan_deterministic", "apply_semantic_fix_plan_deterministic", END],
 )
 agent_builder.add_edge("apply_auto_fix_plan_deterministic", "verify_auto_fix_plan_applied")
 agent_builder.add_conditional_edges(
     "verify_auto_fix_plan_applied",
     route_after_auto_fix_verification,
-    ["apply_canvas_fix_plan_deterministic", END],
+    ["apply_canvas_fix_plan_deterministic", "apply_semantic_fix_plan_deterministic", END],
 )
-agent_builder.add_edge("apply_canvas_fix_plan_deterministic", "record_canvas_auto_fix_event")
+agent_builder.add_conditional_edges(
+    "apply_canvas_fix_plan_deterministic",
+    lambda state: "apply_semantic_fix_plan_deterministic" if state.get("post_fix_validation_mode") == "semantic_fix_pending" else "record_canvas_auto_fix_event",
+    ["apply_semantic_fix_plan_deterministic", "record_canvas_auto_fix_event"],
+)
+agent_builder.add_edge("apply_semantic_fix_plan_deterministic", "record_canvas_auto_fix_event")
 agent_builder.add_edge("record_canvas_auto_fix_event", END)
 
 graph = agent_builder.compile(name="Penpot Design Workflow")

@@ -100,118 +100,22 @@ function applyFontSize(shape, item) {
   };
 }
 
-function hasColorLike(shape, expectedColor) {
-  var serialized = "";
-  try {
-    serialized = JSON.stringify({
-      fills: shape.fills,
-      fillColor: shape.fillColor,
-      color: shape.color,
-      textColor: shape.textColor,
-      strokeColor: shape.strokeColor,
-      strokes: shape.strokes
-    });
-  } catch (err) {
-    serialized = "";
-  }
-  return serialized.indexOf(expectedColor) !== -1;
-}
-
-function applyFillColor(shape, item) {
-  var color = String(item.fill_color || "#FFFFFF");
-  var errors = [];
-  var fills = [{ fillColor: color, color: color }];
-
-  if (!trySet(shape, "fills", fills)) errors.push("fills_assignment_failed");
-  trySet(shape, "fillColor", color);
-  trySet(shape, "color", color);
-
-  if (!hasColorLike(shape, color) && typeof shape.setFillColor === "function") {
-    try {
-      shape.setFillColor(color);
-      errors = [];
-    } catch (err1) {
-      errors.push(String(err1 && err1.message ? err1.message : err1));
-    }
-  }
-
-  if (!hasColorLike(shape, color) && typeof shape.setFills === "function") {
-    try {
-      shape.setFills(fills);
-      errors = [];
-    } catch (err2) {
-      errors.push(String(err2 && err2.message ? err2.message : err2));
-    }
-  }
-
-  var applied = hasColorLike(shape, color);
-  return {
-    applied: applied,
-    actual: { has_color: applied },
-    expected: { fill_color: color },
-    error: applied ? null : (errors.length ? errors.join("; ") : "fill_color_not_applied")
-  };
-}
-
-function applyTextColor(shape, item) {
-  var color = String(item.text_color || "#111827");
-  var errors = [];
-  var fills = [{ fillColor: color, color: color }];
-
-  if (!trySet(shape, "fills", fills)) errors.push("text_fills_assignment_failed");
-  trySet(shape, "fillColor", color);
-  trySet(shape, "color", color);
-  trySet(shape, "textColor", color);
-
-  if (!hasColorLike(shape, color) && typeof shape.setTextColor === "function") {
-    try {
-      shape.setTextColor(color);
-      errors = [];
-    } catch (err1) {
-      errors.push(String(err1 && err1.message ? err1.message : err1));
-    }
-  }
-
-  if (!hasColorLike(shape, color) && typeof shape.setFillColor === "function") {
-    try {
-      shape.setFillColor(color);
-      errors = [];
-    } catch (err2) {
-      errors.push(String(err2 && err2.message ? err2.message : err2));
-    }
-  }
-
-  var applied = hasColorLike(shape, color);
-  return {
-    applied: applied,
-    actual: { has_color: applied },
-    expected: { text_color: color },
-    error: applied ? null : (errors.length ? errors.join("; ") : "text_color_not_applied")
-  };
-}
-
 function applyStroke(shape, item) {
   var color = String(item.stroke_color || "#475569");
   var width = asNumber(item.stroke_width, 1);
   var errors = [];
+
   var strokes = [{ strokeColor: color, color: color, width: width }];
 
   if (!trySet(shape, "strokes", strokes)) errors.push("strokes_assignment_failed");
-  trySet(shape, "strokeColor", color);
-  trySet(shape, "strokeWidth", width);
-
-  if (!hasColorLike(shape, color) && typeof shape.setStrokes === "function") {
-    try {
-      shape.setStrokes(strokes);
-      errors = [];
-    } catch (err1) {
-      errors.push(String(err1 && err1.message ? err1.message : err1));
-    }
+  if (shape.strokes === undefined || shape.strokes === null) {
+    trySet(shape, "strokeColor", color);
+    trySet(shape, "strokeWidth", width);
   }
 
   var hasStroke = false;
   try {
-    hasStroke = !!shape.strokes || !!shape.strokeColor || !!shape.strokeWidth || hasColorLike(shape, color);
+    hasStroke = !!shape.strokes || !!shape.strokeColor || !!shape.strokeWidth;
   } catch (err) {
     hasStroke = false;
   }
@@ -260,10 +164,6 @@ var results = plan.map(function (item) {
     outcome = applyFontSize(shape, item);
   } else if (item.action === "set_stroke") {
     outcome = applyStroke(shape, item);
-  } else if (item.action === "set_fill_color") {
-    outcome = applyFillColor(shape, item);
-  } else if (item.action === "set_text_color") {
-    outcome = applyTextColor(shape, item);
   } else {
     outcome = {
       applied: false,

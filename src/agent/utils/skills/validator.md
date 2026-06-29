@@ -54,6 +54,105 @@ Ejemplo:
   "confidence": 0.95
 }
 
+## Evidencia semántica, assets y tokens nativos
+
+Además de la geometría visual, considera como evidencia positiva las estructuras semánticas generadas por DVCP.
+
+Prioridad de evidencia:
+
+1. **Nativa de Penpot**: `DESIGN_CONTEXT_JSON.native_library`.
+2. **Estructural en canvas**: grupos reales en `node_table`.
+3. **Fallback/debug**: anotaciones visibles DVCP, si existen.
+
+### Evidencia nativa de Penpot
+
+Si `DESIGN_CONTEXT_JSON.native_library.available = true`, revisa:
+
+- `native_library.token_sets`
+- `native_library.components`
+- `native_library.colors`
+- `native_library.typographies`
+
+Nombres nativos importantes:
+
+- Token set: `DVCP/Core`
+- Componentes/assets:
+  - `TextInput/Email`
+  - `TextInput/Password`
+  - `Button/Primary`
+  - `Login/Card`
+
+Tokens esperados:
+
+- `color.primary`
+- `color.primary.hover`
+- `color.text.default`
+- `color.text.inverse`
+- `color.border.input`
+- `color.surface.input`
+- `spacing.12`
+- `spacing.16`
+- `spacing.24`
+- `typography.heading.size`
+- `typography.label.size`
+- `typography.button.size`
+- `border.input.width`
+- `radius.input`
+
+Reglas de evaluación nativa:
+
+- Si existe `DVCP/Core` con tokens de color, spacing y tipografía, considera que hay tokenización básica nativa.
+- Si existen `TextInput/Email` y `TextInput/Password`, considera que la estructura de inputs es componentizable y reutilizable.
+- Si existe `Button/Primary`, considera que el botón tiene evidencia de asset/componente reutilizable.
+- Si existe `Login/Card`, considera que hay patrón de card/login reutilizable.
+- Si hay tokens nativos, no exijas paneles visibles `DesignTokens` en el canvas.
+- Si hay componentes/assets nativos, no marques componentization como `fail`; usa `pass` o `warning` según calidad visual.
+- Si los tokens/assets existen nativamente pero faltan estados profundos, baja como `warning`, no como `fail`.
+
+### Evidencia estructural en canvas
+
+Nombres semánticos importantes:
+
+- `EmailInputGroup`
+- `PasswordInputGroup`
+- `LoginButtonGroup`
+- `EmailInputFocusOutline`
+- `PasswordInputFocusOutline`
+- `LoginButtonFocusOutline`
+- `LoginButtonHoverState`
+- `LoginButtonDisabledState`
+
+Reglas:
+
+- Si existe `EmailInputGroup` o un asset nativo `TextInput/Email`, considera que la asociación label/input de email está documentada.
+- Si existe `PasswordInputGroup` o un asset nativo `TextInput/Password`, considera que la asociación label/input de password está documentada.
+- Si existe `LoginButtonGroup` o un asset nativo `Button/Primary`, considera que el botón tiene estructura reutilizable básica.
+- Si existen `*FocusOutline` o metadata/tokens de focus, considera que hay evidencia de focus state.
+- Si existen `LoginButtonHoverState`, `LoginButtonDisabledState` o metadata de estados en assets, considera que hay evidencia de estados interactivos.
+
+### Fallback/debug visible
+
+Nombres de fallback:
+
+- `DesignTokens`
+- `DesignTokensFallback`
+- `HandoffNotes`
+- `HandoffNotesFallback`
+- `ComponentIndex`
+- `ComponentIndexFallback`
+
+Reglas:
+
+- Si no hay tokens/assets nativos, pero sí hay anotaciones fallback legibles y machine-readable, considera evidencia parcial.
+- No exijas que los tokens sean nativos si el fallback fue creado explícitamente; pero el score máximo debe ser menor que con tokens/assets nativos.
+- No penalices el diseño visual por tener anotaciones si están fuera del layout principal.
+
+Importante:
+
+- El canvas principal debe permanecer limpio; la evidencia preferida vive en Assets/Tokens nativos.
+- No marques frontend_handoff como `fail` si existen `DVCP/Core`, `HandoffNotes`, `ComponentIndex` o assets nativos suficientes; usa `warning` si falta profundidad.
+- No marques accessibility como `fail` solo por ARIA si hay asociación label/input y focus documentados; usa `warning` salvo que visualmente sea ambiguo o ilegible.
+
 ## Issues
 
 Cada issue debe usar `affected_refs`, no objetos completos.
@@ -96,6 +195,17 @@ Reglas de status:
 - needs_minor_fixes: score entre 70 y 84.
 - needs_major_fixes: score entre 50 y 69.
 - not_ready: score menor a 50 o información insuficiente.
+
+## Criterio de mejora por DVCP semántico
+
+Si el diseño tiene layout visual razonable y además existen evidencias semánticas (`DesignTokens`, `HandoffNotes`, grupos o focus/state layers), el score no debe quedarse bloqueado en 65 únicamente por falta de componentes nativos.
+
+Usa esta guía:
+- Componentización con grupos/anotaciones claras: mínimo `warning`, no `fail`.
+- Tokenización documentada: mejora frontend_handoff.
+- Focus outlines documentados: mejora accessibility.
+- Estados hover/disabled documentados: mejora frontend_handoff.
+- Asociación label/input documentada: mejora accessibility.
 
 ## Contexto runtime
 

@@ -810,9 +810,14 @@ async def collect_design_context(shape_id: str) -> dict[str, Any]:
             "node_count": len(nodes),
             "available_sources": available_sources,
             "failed_sources": list(source_errors.keys()),
+            "library_available": bool(structure.get("library", {}).get("available")) if isinstance(structure.get("library"), dict) else False,
         },
         "source_errors": source_errors,
         "overview_preview": overview_preview,
+        # Native Penpot library metadata is intentionally global to the file, even
+        # when the user validates only a selected root. This lets the validator
+        # recognize real Assets/Tokens instead of requiring visible canvas notes.
+        "library": structure.get("library", {}),
         # Keep prompt payload compact. The full tree can be huge and can cause
         # vision request timeouts. Use the flattened node list for matching.
         "nodes": nodes[:MAX_CONTEXT_NODES],
@@ -1431,6 +1436,49 @@ def _node_refs_where(nodes: list[dict[str, Any]], predicate: Any) -> list[str]:
     return refs
 
 
+def compact_native_library_evidence(library: Any) -> dict[str, Any]:
+    """Return compact native Penpot Assets/Tokens evidence for DVCP prompt."""
+    if not isinstance(library, dict):
+        return {"available": False, "token_sets": [], "components": []}
+
+    token_sets_out: list[dict[str, Any]] = []
+    for token_set in (library.get("token_sets") or [])[:12]:
+        if not isinstance(token_set, dict):
+            continue
+        tokens_out: list[dict[str, Any]] = []
+        for token in (token_set.get("tokens") or [])[:60]:
+            if not isinstance(token, dict):
+                continue
+            tokens_out.append({
+                "name": token.get("name", ""),
+                "type": token.get("type", ""),
+                "value": token.get("value"),
+            })
+        token_sets_out.append({
+            "name": token_set.get("name", ""),
+            "token_count": token_set.get("token_count", len(tokens_out)),
+            "tokens": tokens_out,
+        })
+
+    components_out: list[dict[str, Any]] = []
+    for component in (library.get("components") or [])[:80]:
+        if not isinstance(component, dict):
+            continue
+        components_out.append({
+            "name": component.get("name", ""),
+            "type": component.get("type", ""),
+            "id": component.get("id", ""),
+        })
+
+    return {
+        "available": bool(library.get("available")),
+        "token_sets": token_sets_out,
+        "components": components_out,
+        "colors": [item.get("name", "") for item in (library.get("colors") or [])[:40] if isinstance(item, dict)],
+        "typographies": [item.get("name", "") for item in (library.get("typographies") or [])[:40] if isinstance(item, dict)],
+    }
+
+
 def make_dvcp_design_snapshot(design_context: dict[str, Any]) -> dict[str, Any]:
     """Build a compact set/reference snapshot for the LLM.
 
@@ -1483,6 +1531,7 @@ def make_dvcp_design_snapshot(design_context: dict[str, Any]) -> dict[str, Any]:
         "U": [node.get("node_ref", "") for node in nodes if node.get("node_ref")],
         "node_table": node_table,
         "sets": sets,
+        "native_library": compact_native_library_evidence(design_context.get("library")),
         "rules": {
             "reference_only": "Use only refs from U in visual_map.ref and issues.affected_refs.",
             "no_layer_objects": "Do not repeat id/name/type/path in the LLM output.",

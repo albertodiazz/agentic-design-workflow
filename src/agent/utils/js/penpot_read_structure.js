@@ -146,6 +146,78 @@ function serializeShape(shape, depth, path) {
   };
 }
 
+
+function readLibraryItems(collection, maxItems) {
+  var out = [];
+  var candidates = [collection, collection && collection.items, collection && collection.values, collection && collection.components, collection && collection.tokens, collection && collection.sets];
+  for (var c = 0; c < candidates.length && out.length === 0; c++) {
+    var arr = toArray(candidates[c]);
+    for (var i = 0; i < arr.length && out.length < (maxItems || 80); i++) {
+      var item = arr[i];
+      if (!item) continue;
+      var entry = {
+        id: item.id ? String(item.id) : "",
+        name: item.name ? String(item.name) : "",
+        type: item.type ? String(item.type) : "",
+        value: item.value !== undefined ? safePlain(item.value, 6) : null
+      };
+      if (entry.name || entry.id || entry.type) out.push(entry);
+    }
+  }
+  return out;
+}
+
+function readTokenSets(catalog, maxSets, maxTokens) {
+  var sets = [];
+  if (!catalog) return sets;
+
+  var candidates = [catalog.sets, catalog.items, catalog.values, catalog];
+  for (var c = 0; c < candidates.length && sets.length === 0; c++) {
+    var arr = toArray(candidates[c]);
+    for (var i = 0; i < arr.length && sets.length < (maxSets || 20); i++) {
+      var set = arr[i];
+      if (!set) continue;
+      var tokens = readLibraryItems(set.tokens || set.items || set.values || set, maxTokens || 80);
+      var name = set.name ? String(set.name) : "";
+      if (name || tokens.length) {
+        sets.push({
+          id: set.id ? String(set.id) : "",
+          name: name,
+          token_count: tokens.length,
+          tokens: tokens
+        });
+      }
+    }
+  }
+
+  return sets;
+}
+
+function readLibrarySummary() {
+  var library = null;
+  try {
+    if (penpot.library && penpot.library.local) library = penpot.library.local;
+  } catch (err) {}
+
+  var summary = {
+    available: !!library,
+    token_sets: [],
+    components: [],
+    colors: [],
+    typographies: []
+  };
+
+  if (!library) return summary;
+
+  try { summary.token_sets = readTokenSets(library.tokens, 20, 80); } catch (err1) { summary.token_error = String(err1 && err1.message ? err1.message : err1); }
+  try { summary.components = readLibraryItems(library.components, 80); } catch (err2) { summary.components_error = String(err2 && err2.message ? err2.message : err2); }
+  try { summary.colors = readLibraryItems(library.colors, 80); } catch (err3) { summary.colors_error = String(err3 && err3.message ? err3.message : err3); }
+  try { summary.typographies = readLibraryItems(library.typographies, 80); } catch (err4) { summary.typographies_error = String(err4 && err4.message ? err4.message : err4); }
+
+  return summary;
+}
+
+
 var selection = toArray(penpot.selection);
 var currentPage = penpot.currentPage || null;
 var pageChildren = currentPage ? readChildren(currentPage) : [];
@@ -163,6 +235,7 @@ var result = {
   root_source: selection.length > 0 ? "selection" : "current_page_children",
   selection_count: selection.length,
   root_count: roots.length,
+  library: readLibrarySummary(),
   roots: roots.map(function (shape) {
     return serializeShape(shape, 0, "");
   }).filter(Boolean)
