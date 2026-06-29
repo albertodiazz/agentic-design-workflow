@@ -1,256 +1,253 @@
-# Estado actual del flujo DVCP + Penpot Auto-Fix
+# DVCP Penpot Validator
+
+Sistema de validación y corrección de diseños UI en Penpot usando MCP, LangGraph y Mistral Vision.
 
 ## Objetivo
 
-Construir un flujo de validación y corrección para diseños en Penpot usando tres responsabilidades separadas:
+Validar que una pantalla diseñada en Penpot sea entendible para desarrollo frontend, manteniendo separación estricta entre lectura, planeación y escritura sobre el canvas.
 
-* **Validator**: inspecciona el diseño y produce un reporte. No modifica Penpot.
-* **Fixer / Planner**: transforma el reporte en planes de corrección seguros.
-* **Builder / Executor**: aplica cambios sobre Penpot usando MCP `execute_code` y scripts JS.
+```text
+Validator -> lee y evalúa
+Fixer/Planner -> genera planes de corrección
+Executor/Builder -> aplica cambios en Penpot vía MCP
+```
 
-El sistema busca mantener una frontera clara entre lectura, diagnóstico, planeación y escritura.
+## Arquitectura
 
----
+```text
+LangGraph
+├── validate_only
+├── validate_and_fix
+└── validate_and_polish
 
-## Estado del pipeline
+Penpot MCP
+├── high_level_overview
+├── execute_code
+├── export_shape
+└── import_image
+
+Mistral Vision
+└── evalúa imagen + DESIGN_CONTEXT_JSON
+```
+
+## Acciones principales
 
 ### `validate_only`
 
-```text
-run_validator
--> END
-```
+Solo valida. No modifica Penpot.
 
-Sirve para medir el estado actual del diseño. No debe aplicar cambios.
+```json
+{
+  "action": "validate_only",
+  "changeme": "Valida el diseño actualizado",
+  "max_fix_iterations": 1
+}
+```
 
 ### `validate_and_fix`
 
-```text
-run_validator
--> deterministic_rename_phase, si hay auto_fix_plan de rename
--> verify_rename_phase
--> deterministic_canvas_fix_plan, si canvas auto-fix está habilitado
--> apply_canvas_fix_plan
--> END
+Valida y corrige problemas mayores de estructura, naming, layout, color, tipografía y agrupación.
+
+```json
+{
+  "action": "validate_and_fix",
+  "changeme": "Valida y corrige el diseño actual",
+  "max_fix_iterations": 1
+}
 ```
 
-Después de `validate_and_fix`, se debe correr otro `validate_only` para medir si el score visual subió.
+### `validate_and_polish`
 
----
+Valida y pule detalles menores aunque el diseño ya pase. Usa tokens, assets y estados interactivos nativos de Penpot.
 
-## Lo que ya funciona
-
-### 1. DVCP compacto
-
-El validator ya usa un protocolo compacto:
-
-```text
-DesignSnapshot compacto
--> Mistral Vision produce ValidationDelta compacto
--> Python expande a ValidationReport completo
+```json
+{
+  "action": "validate_and_polish",
+  "changeme": "Valida y pule el diseño actual",
+  "max_fix_iterations": 1
+}
 ```
 
-Esto evita que el modelo repita nodos completos y permite trabajar con referencias como `n_003`, `n_004`, etc.
-
-### 2. Rename determinístico
-
-Los cambios de nombre ya no dependen del builder LLM. Python genera un `auto_fix_plan` determinístico para acciones `rename_layer`, y un script JS las aplica por `id`.
-
-Ejemplo aplicado:
+## Dominios de corrección
 
 ```text
-EmailInputLabel      -> EmailInputLabelText
-PasswordInputLabel   -> PasswordInputLabelText
+Canvas Fix Domain
+├── posición
+├── tamaño de fuente
+├── color de texto
+├── fill
+└── stroke
+
+Semantic Fix Domain
+├── grupos semánticos
+├── componentes nativos
+├── assets reutilizables
+└── metadata DVCP
+
+Token Domain
+├── colores
+├── spacing
+├── tipografía
+├── border width
+└── radius
+
+Interactive States Domain
+├── focus
+├── hover
+├── disabled
+└── state metadata
 ```
 
-### 3. Parser de resultados anidados
+## Tokens nativos
 
-`execute_code` puede regresar resultados anidados:
+Token set principal:
 
 ```text
-raw
--> list[0].text
--> wrapper.result
--> JSON real
+DVCP/Core
 ```
 
-El parser ya soporta este formato y puede extraer correctamente `all_applied`, `checked_count`, `applied_count` y `failed_count`.
-
-### 4. Canvas fix plan determinístico
-
-El canvas auto-fix ya no manda instrucciones vagas al builder. Ahora genera un `canvas_fix_plan` explícito y lo aplica con JS.
-
-Acciones implementadas:
+Tokens base:
 
 ```text
-set_position
-set_min_font_size
-set_text_color
-set_fill_color
-set_stroke
+color.action.primary.default
+color.action.primary.hover
+color.action.primary.disabled
+color.focus.ring
+color.text.default
+color.text.inverse
+color.text.disabled
+color.border.input
+color.surface.input
+spacing.12
+spacing.16
+spacing.24
+spacing.32
+spacing.form.gap
+spacing.input.padding.x
+typography.heading.size
+typography.label.size
+typography.button.size
+typography.heading.weight
+typography.label.weight
+typography.button.weight
+border.input.width
+border.focus.width
+radius.input
+radius.button
 ```
 
-El último plan fuerte aplicó correctamente todas sus acciones:
+## Assets/componentes nativos
 
 ```text
-checked_count: 21
-applied_count: 21
-failed_count: 0
+TextInput / Email
+TextInput / Password
+Button / Primary
+TextInput / Email / Focus
+TextInput / Password / Focus
+Button / Primary / Hover
+Button / Primary / Focus
+Button / Primary / Disabled
 ```
 
----
+## Evidencia nativa
 
-## Estado visual actual
-
-El diseño sí cambió visualmente. El validator ya detecta nuevas posiciones como:
+El reader expone evidencia compacta en:
 
 ```text
-LoginTitleText:          y = 340
-EmailInputBackground:    y = 393
-PasswordInputBackground: y = 457
-LoginButtonBackground:   y = 521
+DESIGN_CONTEXT_JSON.native_library
+DESIGN_CONTEXT_JSON.native_library.interactive_state_evidence
 ```
 
-Sin embargo, el score sigue igual:
+Campos esperados:
+
+```json
+{
+  "tokens_complete": true,
+  "states_complete": true,
+  "focus_complete": true,
+  "button_states_complete": true
+}
+```
+
+Si esta evidencia está completa, el validator elimina recomendaciones obsoletas de `required_fixes` y `manual_fixes`.
+
+## Contrato DVCP
+
+El canvas se modela como un universo finito:
 
 ```text
-score: 65
-status: needs_major_fixes
-passed: false
+U = {n_000, n_001, ..., n_k}
 ```
 
-Los principales fallos restantes son:
+El LLM no transporta capas completas. Solo devuelve referencias:
+
+```json
+{
+  "region": "login_button_text",
+  "role": "button_text",
+  "ref": "n_014",
+  "confidence": 0.98
+}
+```
+
+Python expande las referencias a objetos completos, genera planes y ejecuta acciones seguras.
+
+## Invariantes
 
 ```text
-layout_spacing
-componentization
-accessibility
-frontend_handoff
+1. Validator no escribe en Penpot.
+2. Fixer/Planner no ejecuta cambios.
+3. Executor solo aplica planes validados.
+4. Canvas fixes solo operan sobre known targets.
+5. Tokens/assets nativos tienen prioridad sobre anotaciones visibles.
+6. Las anotaciones visibles son fallback/debug, no flujo principal.
+7. validate_only nunca modifica el archivo.
+8. validate_and_polish se activa por acción, no por bandera.
 ```
-
----
-
-## Diagnóstico actual
-
-La infraestructura ya funciona:
-
-```text
-DVCP compacto: OK
-validator read-only: OK
-rename determinístico: OK
-parser execute_code: OK
-canvas_fix_plan: OK
-JS apply canvas: OK
-Penpot update: OK
-validate_only posterior: OK
-```
-
-El problema actual ya no es técnico de aplicación, sino semántico:
-
-```text
-El canvas_fix_plan modifica geometría y estilos,
-pero el validator penaliza estructura y semántica de diseño.
-```
-
-Ejemplos de problemas que no se resuelven solo con posición/color:
-
-```text
-- Inputs no están componentizados.
-- Labels no están asociados estructuralmente a inputs.
-- No hay estados hover/focus/disabled.
-- No hay documentación de handoff.
-- No hay evidencia estructural de accesibilidad.
-```
-
----
-
-## Siguiente fase pendiente
-
-Se debe diseñar una fase nueva:
-
-```text
-semantic_canvas_fix_plan
-```
-
-Esta fase debe planear y aplicar cambios estructurales, no solo visuales.
-
-Acciones candidatas:
-
-```text
-group_layers
-create_component
-create_focus_outline
-create_state_variant
-add_handoff_annotation
-rename_layer_semantic
-```
-
-Estructura deseada:
-
-```text
-LoginContainer
-├── LoginCardBackground
-├── LoginTitleText
-├── EmailInputGroup
-│   ├── EmailInputLabelText
-│   └── EmailInputBackground
-├── PasswordInputGroup
-│   ├── PasswordInputLabelText
-│   └── PasswordInputBackground
-└── LoginButtonGroup
-    ├── LoginButtonBackground
-    └── LoginButtonText
-```
-
-Además, podrían agregarse capas auxiliares o variantes:
-
-```text
-EmailInputFocusOutline
-PasswordInputFocusOutline
-LoginButtonHoverState
-LoginButtonDisabledState
-```
-
----
-
-## Variables relevantes
-
-```bash
-PENPOT_ENABLE_CANVAS_AUTO_FIX=1
-PENPOT_CANVAS_AUTO_FIX_MIN_CONFIDENCE=0.8
-PENPOT_RENAME_AUTO_FIX_MIN_CONFIDENCE=0.8
-```
-
----
 
 ## Archivos principales
 
 ```text
 src/agent/graph.py
 src/agent/utils/agents/design_validator.py
-src/agent/utils/fixer_prompt.py
 src/agent/utils/skills/validator.md
-src/agent/utils/skills/fixer.md
-src/agent/utils/json/auto_fix_constraints.json
-src/agent/utils/json/schemas/validator_delta_contract.json
-src/agent/utils/json/schemas/validator_report_contract.json
 src/agent/utils/js/penpot_read_structure.js
-src/agent/utils/js/penpot_verify_rename_plan.js
-src/agent/utils/js/penpot_apply_rename_plan.js
 src/agent/utils/js/penpot_apply_canvas_fix_plan.js
+src/agent/utils/js/penpot_apply_semantic_fix_plan.js
 ```
 
----
+## Estado actual
 
-## Próximo paso recomendado
-
-Antes de implementar más JS, planear formalmente la fase semántica:
+Último estado validado:
 
 ```text
-1. Definir qué significa componentizar en Penpot.
-2. Definir si se crearán grupos, componentes reales o solo capas semánticas.
-3. Definir cómo representar focus/hover/disabled.
-4. Definir qué puede verificar el validator después.
-5. Definir límites de seguridad para evitar cambios destructivos.
+score: 88
+passed: true
+status: ready
+issues: []
+required_fixes: []
+manual_fixes: []
+can_be_sent_to_development: true
+```
+
+## Workflow recomendado
+
+```text
+1. Seleccionar LoginContainer en Penpot.
+2. Ejecutar validate_only.
+3. Si score < 70, ejecutar validate_and_fix.
+4. Si score >= 70 pero hay detalles menores, ejecutar validate_and_polish.
+5. Ejecutar validate_only final.
+6. Revisar que issues, required_fixes y manual_fixes estén vacíos.
+```
+
+## Resultado esperado
+
+```text
+Canvas limpio
+Tokens nativos completos
+Assets/componentes reutilizables
+Estados interactivos documentados
+Reporte listo para desarrollo frontend
 ```
 
