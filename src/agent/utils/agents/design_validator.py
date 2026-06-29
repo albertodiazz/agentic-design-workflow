@@ -1693,6 +1693,76 @@ def apply_native_interactive_evidence_to_report(
         filtered_issues.append(issue)
     report["issues"] = filtered_issues
 
+    # Clean stale required/manual fixes after deterministic native evidence removes
+    # their underlying issue categories. The LLM may still emit textual
+    # recommendations such as "add focus states" even when the reader proves
+    # that DVCP/Core tokens and native state assets already exist. At this point
+    # `issues` is the source of truth; required_fixes/manual_fixes must not
+    # contradict the deterministic evidence.
+    def _normalize_fix_text(value: Any) -> str:
+        import unicodedata
+
+        text = str(value or "").lower()
+        text = unicodedata.normalize("NFKD", text)
+        return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+    def _should_remove_stale_fix(value: Any) -> bool:
+        text = _normalize_fix_text(value)
+        if not text:
+            return True
+
+        interaction_terms = [
+            "focus", "hover", "disabled", "disable", "interactivo",
+            "interactivos", "estado", "estados", "states", "variant",
+            "variante", "variantes", "outline", "aria",
+        ]
+        token_terms = [
+            "token", "tokens", "dvcp/core", "color.focus.ring",
+            "color.action.primary", "color.text.disabled",
+        ]
+        spacing_terms = [
+            "spacing", "espaciado", "gap", "margen", "padding",
+            "spacing.form.gap", "spacing.16", "spacing.24", "spacing.32",
+        ]
+        component_terms = [
+            "componente", "componentes", "component", "components",
+            "asset", "assets", "textinput", "button/primary",
+        ]
+
+        is_interaction_fix = any(term in text for term in interaction_terms)
+        is_token_fix = any(term in text for term in token_terms)
+        is_spacing_fix = any(term in text for term in spacing_terms)
+        is_component_fix = any(term in text for term in component_terms)
+
+        if states_complete and (is_interaction_fix or is_component_fix):
+            return True
+        if focus_complete and "focus" in text:
+            return True
+        if button_states_complete and any(term in text for term in ["hover", "disabled", "disable", "button/primary", "boton"]):
+            return True
+        if tokens_complete and (is_token_fix or is_spacing_fix):
+            return True
+        return False
+
+    def _clean_fix_list(field: str) -> None:
+        values = report.get(field)
+        if not isinstance(values, list):
+            return
+        cleaned: list[Any] = []
+        seen: set[str] = set()
+        for value in values:
+            if _should_remove_stale_fix(value):
+                continue
+            key = _normalize_fix_text(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(value)
+        report[field] = cleaned[:8]
+
+    _clean_fix_list("required_fixes")
+    _clean_fix_list("manual_fixes")
+
     if states_complete and tokens_complete:
         report["score"] = max(int(report.get("score") or 0), 88)
         report["passed"] = True
