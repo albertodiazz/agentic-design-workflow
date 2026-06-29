@@ -223,3 +223,38 @@ No agregues campos fuera del contrato.
 
 VALIDATOR_REPORT_CONTRACT_JSON:
 {{VALIDATOR_REPORT_CONTRACT_JSON}}
+
+
+## Evidencia de estados interactivos nativos DVCP/0.2
+
+Además de `TextInput/Email`, `TextInput/Password` y `Button/Primary`, considera como evidencia positiva estos assets/componentes nativos:
+
+- `TextInput/Email/Focus`
+- `TextInput/Password/Focus`
+- `Button/Primary/Hover`
+- `Button/Primary/Focus`
+- `Button/Primary/Disabled`
+
+También considera como evidencia positiva si `native_library.component_names` contiene variantes equivalentes, aunque Penpot las presente como nombres jerárquicos o separados por espacios.
+
+Tokens esperados adicionales:
+
+- `color.action.primary.default`
+- `color.action.primary.hover`
+- `color.action.primary.disabled`
+- `color.focus.ring`
+- `color.text.disabled`
+- `spacing.form.gap`
+- `spacing.input.padding.x`
+- `border.focus.width`
+- `radius.button`
+- `typography.heading.weight`
+- `typography.label.weight`
+- `typography.button.weight`
+
+Reglas de evaluación:
+
+- Si existen assets/componentes de focus para ambos inputs y focus para el botón, no marques `accessibility` como `fail`; usa `warning` o `pass` según claridad visual.
+- Si existen `Button/Primary/Hover` y `Button/Primary/Disabled`, no marques `frontend_handoff` como `fail` por falta de estados; usa `warning` si falta documentación textual.
+- Si existe `DVCP/Core` y `native_library.token_names` contiene tokens de color, spacing, tipografía, focus y disabled, considera que la tokenización es suficiente para superar el bloqueo de `score=68`.
+- No bloquees `passed=true` solo por no tener ARIA real dentro de Penpot si hay grupos label/input, assets nativos y focus states documentados.

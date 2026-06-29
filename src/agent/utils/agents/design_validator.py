@@ -564,8 +564,11 @@ def compact_for_prompt(
 
 
 def json_for_prompt(value: Any, *, max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    # Native token/component evidence is shallow but nested enough that the
+    # default max_depth=6 can truncate token names. Keep a little more depth
+    # so the validator can see actual token names and state assets.
     text = json.dumps(
-        compact_for_prompt(value),
+        compact_for_prompt(value, max_depth=9, max_items=80, max_string=800),
         ensure_ascii=False,
         default=str,
         indent=2,
@@ -1470,10 +1473,26 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
             "id": component.get("id", ""),
         })
 
+    token_names: list[str] = []
+    token_set_names: list[str] = []
+    for token_set in token_sets_out:
+        name = str(token_set.get("name") or "")
+        if name:
+            token_set_names.append(name)
+        for token in token_set.get("tokens") or []:
+            token_name = str(token.get("name") or "")
+            if token_name:
+                token_names.append(token_name)
+
+    component_names = [str(item.get("name") or "") for item in components_out if item.get("name")]
+
     return {
         "available": bool(library.get("available")),
         "token_sets": token_sets_out,
+        "token_set_names": token_set_names,
+        "token_names": token_names[:160],
         "components": components_out,
+        "component_names": component_names[:160],
         "colors": [item.get("name", "") for item in (library.get("colors") or [])[:40] if isinstance(item, dict)],
         "typographies": [item.get("name", "") for item in (library.get("typographies") or [])[:40] if isinstance(item, dict)],
     }

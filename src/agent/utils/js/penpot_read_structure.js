@@ -158,9 +158,17 @@ function readLibraryItems(collection, maxItems) {
       var entry = {
         id: item.id ? String(item.id) : "",
         name: item.name ? String(item.name) : "",
+        path: item.path ? String(item.path) : "",
         type: item.type ? String(item.type) : "",
-        value: item.value !== undefined ? safePlain(item.value, 6) : null
+        value: item.value !== undefined ? safePlain(item.value, 6) : null,
+        dvcpStates: item.dvcpStates !== undefined ? safePlain(item.dvcpStates, 12) : null
       };
+      try {
+        if (typeof item.getPluginData === "function") {
+          var states = item.getPluginData("dvcp.states");
+          if (states) entry.dvcpStatesSerialized = String(states);
+        }
+      } catch (errState) {}
       if (entry.name || entry.id || entry.type) out.push(entry);
     }
   }
@@ -213,6 +221,16 @@ function readLibrarySummary() {
   try { summary.components = readLibraryItems(library.components, 80); } catch (err2) { summary.components_error = String(err2 && err2.message ? err2.message : err2); }
   try { summary.colors = readLibraryItems(library.colors, 80); } catch (err3) { summary.colors_error = String(err3 && err3.message ? err3.message : err3); }
   try { summary.typographies = readLibraryItems(library.typographies, 80); } catch (err4) { summary.typographies_error = String(err4 && err4.message ? err4.message : err4); }
+
+  summary.token_set_names = summary.token_sets.map(function (set) { return String(set.name || ""); }).filter(Boolean);
+  summary.token_names = [];
+  for (var tsi = 0; tsi < summary.token_sets.length; tsi++) {
+    var tsTokens = summary.token_sets[tsi].tokens || [];
+    for (var ti = 0; ti < tsTokens.length; ti++) {
+      if (tsTokens[ti] && tsTokens[ti].name) summary.token_names.push(String(tsTokens[ti].name));
+    }
+  }
+  summary.component_names = summary.components.map(function (component) { return String(component.name || ""); }).filter(Boolean);
 
   return summary;
 }

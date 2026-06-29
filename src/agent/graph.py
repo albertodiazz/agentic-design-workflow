@@ -56,6 +56,7 @@ Action = Literal[
     "validate_only",
     "build_and_validate",
     "validate_and_fix",
+    "validate_and_polish",
     "build_validate_and_fix",
 ]
 
@@ -69,6 +70,7 @@ def normalize_action(action: str | None) -> str:
         "validate_only",
         "build_and_validate",
         "validate_and_fix",
+        "validate_and_polish",
         "build_validate_and_fix",
     }
 
@@ -82,6 +84,7 @@ def action_starts_with_validation(action: str) -> bool:
     return action in {
         "validate_only",
         "validate_and_fix",
+        "validate_and_polish",
     }
 
 
@@ -89,6 +92,7 @@ def action_requires_validation_after_build(action: str) -> bool:
     return action in {
         "build_and_validate",
         "validate_and_fix",
+        "validate_and_polish",
         "build_validate_and_fix",
     }
 
@@ -96,8 +100,13 @@ def action_requires_validation_after_build(action: str) -> bool:
 def action_allows_fixing(action: str) -> bool:
     return action in {
         "validate_and_fix",
+        "validate_and_polish",
         "build_validate_and_fix",
     }
+
+
+def action_is_polish(action: str) -> bool:
+    return action == "validate_and_polish"
 
 
 # ---------------------------------------------------------------------
@@ -447,6 +456,22 @@ def has_executable_fix(state: OverallState) -> bool:
     safe known targets exist.
     """
     return has_auto_fix_plan(state) or has_canvas_auto_fix_candidates(state)
+
+
+def has_semantic_polish_candidates(state: OverallState) -> bool:
+    """Return True when validate_and_polish can run a semantic polish plan.
+
+    This path intentionally ignores the normal `passed=true -> END` shortcut.
+    It is used after the design already passes, but still has minor/medium
+    issues around native tokens, interactive states, component metadata or
+    handoff documentation.
+    """
+    validation_report = state.get("validation_report")
+    if not isinstance(validation_report, dict):
+        return False
+    if not _semantic_issue_present(validation_report):
+        return False
+    return bool(extract_known_canvas_targets(validation_report))
 
 
 def parse_tool_json_result(value: Any) -> dict[str, Any]:
@@ -950,6 +975,8 @@ def _semantic_issue_present(validation_report: Any) -> bool:
         "componentization",
         "accessibility",
         "frontend_handoff",
+        "layout_spacing",
+        "text_legibility",
         "design_tokens",
         "handoff",
     }
@@ -987,6 +1014,8 @@ def _bbox_union(items: list[dict[str, Any]]) -> dict[str, int]:
 def build_deterministic_semantic_fix_plan(
     validation_report: Any,
     known_targets: list[dict[str, Any]],
+    *,
+    force: bool = False,
 ) -> list[dict[str, Any]]:
     """Build native Penpot semantic/tokenization fixes.
 
@@ -1000,7 +1029,7 @@ def build_deterministic_semantic_fix_plan(
 
         PENPOT_SEMANTIC_FALLBACK_ANNOTATIONS=1
     """
-    if not semantic_auto_fix_enabled():
+    if not force and not semantic_auto_fix_enabled():
         return []
 
     if not isinstance(validation_report, dict) or not known_targets:
@@ -1034,20 +1063,32 @@ def build_deterministic_semantic_fix_plan(
     plan: list[dict[str, Any]] = []
 
     token_specs = [
-        {"name": "color.primary", "type": "color", "value": "#2563EB"},
-        {"name": "color.primary.hover", "type": "color", "value": "#1D4ED8"},
+        # Avoid parent/child token name collisions in Penpot by using full leaf names.
+        {"name": "color.action.primary.default", "type": "color", "value": "#2563EB"},
+        {"name": "color.action.primary.hover", "type": "color", "value": "#1D4ED8"},
+        {"name": "color.action.primary.disabled", "type": "color", "value": "#CBD5E1"},
+        {"name": "color.focus.ring", "type": "color", "value": "#38BDF8"},
         {"name": "color.text.default", "type": "color", "value": "#111827"},
         {"name": "color.text.inverse", "type": "color", "value": "#FFFFFF"},
+        {"name": "color.text.disabled", "type": "color", "value": "#64748B"},
         {"name": "color.border.input", "type": "color", "value": "#94A3B8"},
         {"name": "color.surface.input", "type": "color", "value": "#FFFFFF"},
         {"name": "spacing.12", "type": "spacing", "value": "12px"},
         {"name": "spacing.16", "type": "spacing", "value": "16px"},
         {"name": "spacing.24", "type": "spacing", "value": "24px"},
+        {"name": "spacing.32", "type": "spacing", "value": "32px"},
+        {"name": "spacing.form.gap", "type": "spacing", "value": "24px"},
+        {"name": "spacing.input.padding.x", "type": "spacing", "value": "12px"},
         {"name": "typography.heading.size", "type": "fontSizes", "value": "24px"},
         {"name": "typography.label.size", "type": "fontSizes", "value": "14px"},
         {"name": "typography.button.size", "type": "fontSizes", "value": "16px"},
+        {"name": "typography.heading.weight", "type": "fontWeights", "value": "600"},
+        {"name": "typography.label.weight", "type": "fontWeights", "value": "400"},
+        {"name": "typography.button.weight", "type": "fontWeights", "value": "500"},
         {"name": "border.input.width", "type": "borderWidth", "value": "1px"},
+        {"name": "border.focus.width", "type": "borderWidth", "value": "2px"},
         {"name": "radius.input", "type": "borderRadius", "value": "6px"},
+        {"name": "radius.button", "type": "borderRadius", "value": "6px"},
     ]
 
     plan.append({
@@ -1086,8 +1127,8 @@ def build_deterministic_semantic_fix_plan(
         add_token_assignment(input_bg, "color.border.input", ["stroke"], "Bind input border token.")
         add_token_assignment(input_bg, "border.input.width", ["strokeWidth"], "Bind input border width token.")
         add_token_assignment(input_bg, "radius.input", ["borderRadius"], "Bind input radius token.")
-    add_token_assignment(button_bg, "color.primary", ["fill"], "Bind primary button fill token.")
-    add_token_assignment(button_bg, "color.primary.hover", ["stroke"], "Bind primary button stroke/hover token.")
+    add_token_assignment(button_bg, "color.action.primary.default", ["fill"], "Bind primary button fill token.")
+    add_token_assignment(button_bg, "color.focus.ring", ["stroke"], "Bind primary button focus stroke token.")
 
     if assignments:
         plan.append({
@@ -1133,6 +1174,40 @@ def build_deterministic_semantic_fix_plan(
         "Create native Penpot asset/component for primary login button.",
     )
 
+    # Native interactive state assets. These are lightweight component entries that
+    # document the intended focus/hover/disabled states in Penpot Assets without
+    # adding visible debug panels to the main canvas.
+    native_component(
+        "TextInput/Email/Focus",
+        "text_input_focus_state",
+        [email_bg, email_label],
+        "Create native focus-state asset for email input.",
+    )
+    native_component(
+        "TextInput/Password/Focus",
+        "text_input_focus_state",
+        [password_bg, password_label],
+        "Create native focus-state asset for password input.",
+    )
+    native_component(
+        "Button/Primary/Hover",
+        "button_hover_state",
+        [button_bg, button_text],
+        "Create native hover-state asset for primary button.",
+    )
+    native_component(
+        "Button/Primary/Disabled",
+        "button_disabled_state",
+        [button_bg, button_text],
+        "Create native disabled-state asset for primary button.",
+    )
+    native_component(
+        "Button/Primary/Focus",
+        "button_focus_state",
+        [button_bg, button_text],
+        "Create native focus-state asset for primary button.",
+    )
+
     if card and title and button_bg:
         children = [item for item in [card, title, email_bg, email_label, password_bg, password_label, button_bg, button_text] if item]
         native_component(
@@ -1144,16 +1219,35 @@ def build_deterministic_semantic_fix_plan(
 
     # Store interaction semantics as native token metadata/spec where possible.
     # Visible state examples are now a fallback/debug concern, not the primary path.
-    if button_bg:
+    for component_name, states in [
+        (
+            "TextInput/Email",
+            [
+                {"name": "default", "fill_token": "color.surface.input", "stroke_token": "color.border.input"},
+                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
+            ],
+        ),
+        (
+            "TextInput/Password",
+            [
+                {"name": "default", "fill_token": "color.surface.input", "stroke_token": "color.border.input"},
+                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
+            ],
+        ),
+        (
+            "Button/Primary",
+            [
+                {"name": "default", "fill_token": "color.action.primary.default", "text_token": "color.text.inverse"},
+                {"name": "hover", "fill_token": "color.action.primary.hover", "text_token": "color.text.inverse"},
+                {"name": "disabled", "fill_token": "color.action.primary.disabled", "text_token": "color.text.disabled"},
+                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
+            ],
+        ),
+    ]:
         plan.append({
             "action": "ensure_native_component_state_metadata",
-            "component_name": "Button/Primary",
-            "states": [
-                {"name": "default", "fill_token": "color.primary", "text_token": "color.text.inverse"},
-                {"name": "hover", "fill_token": "color.primary.hover", "text_token": "color.text.inverse"},
-                {"name": "disabled", "fill": "#CBD5E1", "text": "#64748B"},
-                {"name": "focus", "stroke_token": "color.primary.hover", "stroke_width": 2},
-            ],
+            "component_name": component_name,
+            "states": states,
             "fallback_annotations": fallback_annotations,
             "reason": "Document interaction states as native component metadata when supported.",
             "safety": "safe_native_component_metadata",
@@ -1186,7 +1280,7 @@ def build_deterministic_semantic_fix_plan(
             "name": "ComponentIndexFallback",
             "semantic_role": "component_index_fallback",
             "bbox": {"x": panel_x, "y": panel_y + 496, "width": 360, "height": 160},
-            "components": ["TextInput/Email", "TextInput/Password", "Button/Primary", "Login/Card", "DVCP/Core"],
+            "components": ["TextInput/Email", "TextInput/Password", "TextInput/Email/Focus", "TextInput/Password/Focus", "Button/Primary", "Button/Primary/Hover", "Button/Primary/Focus", "Button/Primary/Disabled", "Login/Card", "DVCP/Core"],
             "reason": "Fallback only: visible index for validator/handoff.",
             "safety": "safe_semantic_fix_create_helper_layer",
         })
@@ -1529,6 +1623,63 @@ async def fix_design(
             "messages": [AIMessage(content=error_message)],
             "response": error_message,
             "skip_validation": True,
+        }
+
+    action = normalize_action(state.get("action"))
+
+    if action_is_polish(action):
+        known_targets = extract_known_canvas_targets(validation_report)
+        if not known_targets:
+            message = (
+                "validate_and_polish omitido: no hay known_targets con "
+                f"confidence >= {canvas_confidence_threshold():.2f}."
+            )
+            return {
+                "messages": [AIMessage(content=message)],
+                "response": message,
+                "skip_validation": True,
+            }
+
+        semantic_fix_plan = build_deterministic_semantic_fix_plan(
+            validation_report,
+            known_targets,
+            force=True,
+        )
+        if not semantic_fix_plan:
+            message = (
+                "validate_and_polish omitido: no se generó semantic_fix_plan "
+                "de polish para tokens/assets/estados interactivos."
+            )
+            return {
+                "messages": [AIMessage(content=message)],
+                "response": message,
+                "skip_validation": True,
+            }
+
+        next_iteration = fix_iterations + 1
+        polish_event = {
+            "type": "polish_auto_fix_start",
+            "status": "pending",
+            "verified_at": utc_now_iso(),
+            "fix_iteration": next_iteration,
+            "mode": "semantic_polish_native_tokens_assets",
+            "trigger": "action:validate_and_polish",
+            "confidence_threshold": canvas_confidence_threshold(),
+            "known_target_count": len(known_targets),
+        }
+
+        return {
+            "fix_iterations": next_iteration,
+            "last_auto_fix_plan": [],
+            "last_canvas_fix_targets": known_targets,
+            "last_canvas_fix_plan": [],
+            "last_semantic_fix_plan": semantic_fix_plan,
+            "post_fix_validation_mode": "semantic_fix_pending",
+            "auto_fix_verified": False,
+            "auto_fix_event": polish_event,
+            "auto_fix_verification": None,
+            "response": None,
+            "skip_validation": False,
         }
 
     auto_fix_plan = get_auto_fix_plan_from_report(validation_report)
@@ -2021,13 +2172,16 @@ async def record_canvas_auto_fix_event(
     else:
         canvas_status = "unverified"
 
+    action = normalize_action(state.get("action"))
+    is_polish_mode = action_is_polish(action)
+
     event = {
-        "type": "canvas_auto_fix_execution",
+        "type": "polish_auto_fix_execution" if is_polish_mode else "canvas_auto_fix_execution",
         "status": canvas_status,
         "verified_at": utc_now_iso(),
         "fix_iteration": fix_iteration,
-        "mode": "canvas_auto_fix_known_targets_only",
-        "env_flag": "PENPOT_ENABLE_CANVAS_AUTO_FIX",
+        "mode": "semantic_polish_native_tokens_assets" if is_polish_mode else "canvas_auto_fix_known_targets_only",
+        "trigger": "action:validate_and_polish" if is_polish_mode else "env:PENPOT_ENABLE_CANVAS_AUTO_FIX",
         "confidence_threshold": canvas_confidence_threshold(),
         "known_target_count": len(known_targets) if isinstance(known_targets, list) else 0,
         "known_targets": known_targets if isinstance(known_targets, list) else [],
@@ -2039,6 +2193,11 @@ async def record_canvas_auto_fix_event(
         "semantic_apply_result": semantic_result if isinstance(semantic_result, dict) else None,
         "rename_verification_event": rename_event,
         "message": (
+            "validate_and_polish ran semantic/native-token polish on known targets. "
+            "It may create or update native Penpot tokens, component assets, and "
+            "interactive-state metadata without broad canvas layout edits. "
+            "Run validate_only to score the updated design."
+            if is_polish_mode else
             "Canvas/semantic auto-fix mode ran after rename_layer fixes were "
             "structurally verified, or after rename_phase=no_op when no rename "
             "was needed. The executor was allowed to modify known targets and "
@@ -2058,13 +2217,17 @@ async def record_canvas_auto_fix_event(
         "auto_fix_event": event,
         "auto_fix_verification": {
             "all_applied": None,
-            "verification_type": "canvas_auto_fix_unverified",
-            "reason": "known-target canvas/semantic changes require a fresh validate_only run",
+            "verification_type": "semantic_polish_unverified" if is_polish_mode else "canvas_auto_fix_unverified",
+            "reason": "semantic polish changes require a fresh validate_only run" if is_polish_mode else "known-target canvas/semantic changes require a fresh validate_only run",
             "canvas_apply_result": canvas_result if isinstance(canvas_result, dict) else None,
             "semantic_apply_result": semantic_result if isinstance(semantic_result, dict) else None,
         },
         "post_fix_validation_mode": None,
         "response": (
+            "validate_and_polish ejecutado. Se aplicó polish semántico con tokens/assets "
+            "nativos y estados interactivos cuando existía plan. Corre validate_only para "
+            "obtener el nuevo score del diseño actualizado."
+            if is_polish_mode else
             "Canvas/semantic auto-fix ejecutado en modo ampliado. "
             "Se aplicaron cambios visuales y artefactos semánticos/tokens cuando existía plan. "
             "Corre validate_only para obtener un nuevo score del diseño actualizado."
@@ -2162,16 +2325,21 @@ def route_after_validator(
     if not action_allows_fixing(action):
         return END
 
-    if validation_passed(state):
-        return END
-
-    if not has_executable_fix(state):
-        return END
-
     fix_iterations = int(state.get("fix_iterations", 0) or 0)
     max_fix_iterations = int(state.get("max_fix_iterations", 2) or 2)
 
     if fix_iterations >= max_fix_iterations:
+        return END
+
+    if action_is_polish(action):
+        if has_semantic_polish_candidates(state):
+            return "fix_design"
+        return END
+
+    if validation_passed(state):
+        return END
+
+    if not has_executable_fix(state):
         return END
 
     return "fix_design"

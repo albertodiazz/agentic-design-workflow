@@ -652,12 +652,32 @@ function applyNativeTokens(item, shapesById, tokenSpecs) {
   };
 }
 
+function normalizeComponentName(value) {
+  return String(value || "").replace(/\s*\/\s*/g, "/").replace(/\s+/g, "").toLowerCase();
+}
+
 function findNativeComponent(componentName) {
   var components = getComponentsCatalog();
   var found = findByName(components, componentName);
   if (found) return found;
 
+  var wanted = normalizeComponentName(componentName);
+  var catalogs = [components];
   var lib = getLocalLibrary();
+  if (lib) {
+    try { catalogs.push(lib.components); } catch (err0) {}
+  }
+
+  for (var c = 0; c < catalogs.length; c++) {
+    var arr = toArray(catalogs[c]);
+    for (var i = 0; i < arr.length; i++) {
+      var name = objectName(arr[i]);
+      if (normalizeComponentName(name) === wanted) return arr[i];
+      // Penpot may show hierarchical assets as leaf names inside groups.
+      if (wanted.split("/").pop() === normalizeComponentName(name)) return arr[i];
+    }
+  }
+
   if (lib) {
     try { return findByName(lib.components, componentName); } catch (err) {}
   }
