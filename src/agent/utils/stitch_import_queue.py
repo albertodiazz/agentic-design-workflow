@@ -462,6 +462,7 @@ SOURCE_EXPECTED_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
     "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
     "box_shadow", "input_type", "is_material_symbol", "material_symbol_name",
+    "text_no_wrap", "expected_line_count", "source_line_count", "penpot_grow_type",
 )
 
 
@@ -570,7 +571,7 @@ def _comparison_profile_for(trace: dict[str, Any], source_snapshot: dict[str, An
         fields = {"bbox", "fill", "stroke", "stroke_width", "radius", "opacity"}
         intent = "control"
     elif component_type == "icon_container":
-        # v06.12: visible wrappers around icon glyphs are surfaces. Compare
+        # v06.13: visible wrappers around icon glyphs are surfaces. Compare
         # their own fill/radius, not glyph color/font properties.
         fields = {"bbox", "fill", "stroke", "stroke_width", "radius", "opacity", "box_shadow"}
         intent = "icon_container_surface"
@@ -628,7 +629,7 @@ def _line_height_values_equivalent(expected: Any, actual: Any, op_values: dict[s
     act = _num(actual, 0)
     if exp <= 0 and act <= 0:
         return True
-    # v06.12: CSS/source line-height may be px, while Penpot behaves more
+    # v06.13: CSS/source line-height may be px, while Penpot behaves more
     # predictably with a unitless ratio. If the source px is preserved in the
     # op, the mapping is faithful even when op.line_height is the Penpot ratio.
     src_px = _num(op_values.get("source_line_height_px"), 0)
@@ -845,7 +846,7 @@ def _project_expected_for_slot(
             out.pop(key, None)
 
     elif slot_kind == "icon":
-        # v06.12: distinguish real Material Symbols glyphs from inferred icon
+        # v06.13: distinguish real Material Symbols glyphs from inferred icon
         # slots. Real glyphs must preserve the icon-font family and ligature
         # text; inferred slots still compare only bbox/paint/text.
         fam = str(expected.get("font_family") or expected.get("source_font_family") or op_values.get("font_family") or op_values.get("source_font_family") or "").lower()
@@ -881,7 +882,7 @@ def _project_expected_for_slot(
 
     return {
         "schema": "dvcp.source_slot_projection.v1",
-        "version": "v06.12",
+        "version": "v06.13",
         "source_ref": source_snapshot.get("source_ref"),
         "slot_kind": slot_kind,
         "slot": trace.get("slot"),
@@ -1057,7 +1058,7 @@ def _style_drift_diagnostics(
                     "autofixable": True,
                 })
 
-    # v06.12: readback font fidelity diagnostics. Family fallback is a warning,
+    # v06.13: readback font fidelity diagnostics. Family fallback is a warning,
     # but weight mismatch is a real visual issue because Stitch explicitly
     # specifies weights such as Inter 700 for headings.
     if shape_ids and ({"font_family", "font_weight"} & set(fields)):
@@ -1102,6 +1103,31 @@ def _style_drift_diagnostics(
                 "message": "Penpot text weight differs from Stitch computed style; material symbol fidelity should preserve the source weight.",
                 "autofixable": True,
             })
+
+        expected_lines = _num(op_values.get("expected_line_count") or op_values.get("source_line_count"), 0)
+        expected_grow = str(op_values.get("penpot_grow_type") or "").lower()
+        actual_grow = str(rb_style.get("growType") if isinstance(rb_style, dict) else "").lower()
+        if expected_lines and expected_lines <= 1.15 and op_values.get("text_no_wrap"):
+            if expected_grow == "auto-width" and actual_grow and actual_grow != "auto-width":
+                issues.append({
+                    "category": "single_line_text_wrap_risk",
+                    "field": "growType",
+                    "severity": "medium",
+                    "expected": "auto-width",
+                    "actual": rb_style.get("growType"),
+                    "message": "Stitch rendered this text as one line; Penpot kept a fixed text box, so it may wrap visually.",
+                    "autofixable": True,
+                })
+            else:
+                warnings.append({
+                    "category": "single_line_text_no_wrap",
+                    "field": "growType",
+                    "severity": "info",
+                    "expected": expected_grow or "single_line",
+                    "actual": rb_style.get("growType") if isinstance(rb_style, dict) else None,
+                    "message": "Source text height indicates one visual line; importer requested no-wrap fidelity.",
+                    "autofixable": False,
+                })
 
     high = sum(1 for issue in issues if issue.get("severity") == "high")
     medium = sum(1 for issue in issues if issue.get("severity") == "medium")
@@ -1213,7 +1239,7 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     report = {
         "schema": "dvcp.source_penpot_deterministic_report.v6",
         "mode": "source_map_no_llm",
-        "cleanup": "v06.12_icon_source_precedence",
+        "cleanup": "v06.13_text_no_wrap_fidelity",
         "mapping_count": len(mappings),
         "mapped_shape_count": mapped,
         "issue_count": real_issue_count,
@@ -1235,6 +1261,12 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     return mappings, report
 
 
+
+
+def _is_material_symbol_op_values(op: dict[str, Any]) -> bool:
+    family = str(op.get("font_family") or op.get("source_font_family") or "").lower()
+    css = str(op.get("css_class") or "").lower()
+    return bool(op.get("is_material_symbol") or "material symbols" in family or "material icons" in family or "material-symbol" in css)
 
 
 def _normalise_text_fidelity_fields(op: dict[str, Any]) -> None:
@@ -1267,6 +1299,23 @@ def _normalise_text_fidelity_fields(op: dict[str, Any]) -> None:
     op["line_height"] = round(ratio, 3)
     if op.get("font_family") and not op.get("source_font_family"):
         op["source_font_family"] = op.get("font_family")
+
+    bbox = op.get("bbox") if isinstance(op.get("bbox"), dict) else {}
+    source_h = _num(bbox.get("height"), 0)
+    source_line_count = source_h / max(source_px, 1) if source_h > 0 else 1.0
+    if source_line_count <= 0:
+        source_line_count = 1.0
+    op["source_line_count"] = round(source_line_count, 3)
+    op["expected_line_count"] = max(1, int(round(source_line_count))) if source_line_count > 1.15 else 1
+    is_single_line = source_line_count <= 1.15
+    if is_single_line:
+        op["text_no_wrap"] = True
+    align = str(op.get("text_align") or "left").lower()
+    is_material = _is_material_symbol_op_values(op) or kind == "icon"
+    if is_single_line and not is_material and align in {"start", "left"}:
+        op["penpot_grow_type"] = "auto-width"
+    else:
+        op.setdefault("penpot_grow_type", "fixed")
 
 def _item_to_op(
     item: dict[str, Any],
@@ -1358,6 +1407,10 @@ def _item_to_op(
         "deterministic_transform",
         "dom_path",
         "ghost",
+        "text_no_wrap",
+        "expected_line_count",
+        "source_line_count",
+        "penpot_grow_type",
         "allow_no_shape",
     ):
         if item.get(style_key) is not None:

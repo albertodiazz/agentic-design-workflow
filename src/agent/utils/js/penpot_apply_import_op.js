@@ -423,7 +423,7 @@ function compactOpVisualValues(op) {
   var keys = [
     "text", "fill", "stroke", "stroke_width", "color", "text_color", "font_size",
     "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity",
-    "fill_opacity", "box_shadow", "input_type"
+    "fill_opacity", "box_shadow", "input_type", "text_no_wrap", "expected_line_count", "source_line_count", "penpot_grow_type"
   ];
   for (var i = 0; i < keys.length; i++) {
     var k = keys[i];
@@ -441,6 +441,11 @@ function compactShapeReadback(shape) {
       var v = shape[props[i]];
       if (v !== undefined && v !== null && typeof v !== "function") out[props[i]] = v;
     } catch (err) {}
+  }
+  var pd = ["dvcp_grow_type", "text_no_wrap", "expected_line_count", "source_line_count"];
+  for (var pi = 0; pi < pd.length; pi++) {
+    var pv = getPluginDataSafe(shape, pd[pi]);
+    if (pv !== undefined && pv !== null && String(pv) !== "") out[pd[pi]] = pv;
   }
   return out;
 }
@@ -470,7 +475,7 @@ function createVisualMaterializedShape(op, offset) {
   var svg = visualSvgForOp(op);
   var info = {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.12",
+    version: "v06.13",
     method: "svg_fallback",
     visually_materialized: false,
     fallback_used: false,
@@ -634,13 +639,13 @@ function normalizeFontFamily(value) {
   var v = String(value || "").trim();
   if (!v) return "";
   var lower = v.toLowerCase();
-  // v06.12: Material Symbols are icon-font ligatures. Do not strip the
+  // v06.13: Material Symbols are icon-font ligatures. Do not strip the
   // family, otherwise Penpot renders words such as "person" or
   // "arrow_forward" as normal text.
   if (lower.indexOf("material symbols") >= 0) return "Material Symbols Outlined";
   if (lower.indexOf("material icons") >= 0) return "Material Icons";
   if (lower.indexOf("system-ui") >= 0 || lower.indexOf("sans-serif") >= 0) return "";
-  // v06.12: try to preserve the source family. If Penpot cannot resolve it, the
+  // v06.13: try to preserve the source family. If Penpot cannot resolve it, the
   // readback/report will record the fallback explicitly instead of hiding it.
   return v;
 }
@@ -791,6 +796,28 @@ function setText(shape, value) {
   return ok;
 }
 
+function textNoWrapFromOp(op) {
+  op = op || {};
+  if (op.text_no_wrap === true || String(op.text_no_wrap).toLowerCase() === "true") return true;
+  if (op.no_wrap === true || String(op.no_wrap).toLowerCase() === "true") return true;
+  var expectedLineCount = asNumber(op.expected_line_count || op.source_line_count, 0);
+  return expectedLineCount > 0 && expectedLineCount <= 1.15;
+}
+
+function textGrowTypeFromOp(op) {
+  op = op || {};
+  var explicit = String(op.penpot_grow_type || op.growType || op.grow_type || "").trim();
+  if (explicit) return explicit;
+  var align = normalizeTextAlign(op.text_align || "left");
+  var material = isMaterialSymbolOp(op);
+  // v06.13: one-line left/start labels must not wrap in Penpot. Keep
+  // centered/right text fixed so headings and CTA labels preserve their source
+  // alignment box.
+  if (!material && textNoWrapFromOp(op) && (align === "left" || align === "start")) return "auto-width";
+  if (textNoWrapFromOp(op) && material) return "fixed";
+  return "fixed";
+}
+
 function setTextStyle(shape, op) {
   if (!shape) return false;
   var ok = false;
@@ -801,11 +828,12 @@ function setTextStyle(shape, op) {
   var align = normalizeTextAlign(op.text_align || "left");
   var sourceLineHeightPx = sourceLineHeightPxFromOp(op, fontSize);
   var lineHeightRatio = penpotLineHeightRatioFromOp(op, fontSize);
+  var growType = textGrowTypeFromOp(op);
 
   // Text layers in Penpot MCP are sensitive to a few properties. Set the same
   // semantic value through several known API/property names so the layer is
   // visible both in canvas and export_shape.
-  ok = trySet(shape, "growType", "fixed") || ok;
+  ok = trySet(shape, "growType", growType) || ok;
   ok = trySet(shape, "verticalAlign", "top") || ok;
   ok = trySet(shape, "fontSize", String(fontSize)) || ok;
   ok = trySet(shape, "font-size", String(fontSize)) || ok;
@@ -827,9 +855,11 @@ function setTextStyle(shape, op) {
   if (typeof shape.setFontFamily === "function" && normalizedFamily) {
     try { shape.setFontFamily(normalizedFamily); ok = true; } catch (err3) {}
   }
-  // Apply weight after family/size/text mutations. Some Penpot runtimes reset
-  // the selected style to Regular when family is applied.
+  // Apply weight and grow type after family/size/text mutations. Some Penpot
+  // runtimes reset the selected style to Regular or fixed box after family is
+  // applied.
   ok = applyDynamicFontWeight(shape, fontWeight) || ok;
+  ok = trySet(shape, "growType", growType) || ok;
   return ok;
 }
 
@@ -899,8 +929,8 @@ function createText(name, text, bbox, color, fontSize, offset, style) {
   if (!shape) return null;
   setName(shape, name || "Text");
   setText(shape, value);
-  trySet(shape, "growType", "auto-height");
   style = style || {};
+  trySet(shape, "growType", textGrowTypeFromOp(style));
   style.color = color || style.color || "#0F172A";
   style.font_size = fontSize || style.font_size || 14;
   if (style.source_line_height_px === undefined && style.line_height !== undefined && asNumber(style.line_height, 0) > 4) style.source_line_height_px = style.line_height;
@@ -1035,7 +1065,7 @@ function nativeVisualInfo(op, method, created, error) {
   var expectedText = !!op.text;
   return {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.12",
+    version: "v06.13",
     method: method || "native_first",
     materialization_kind: "native_penpot_shapes",
     visually_materialized: created.length > 0,
@@ -1194,7 +1224,11 @@ function textStyleFromOp(op) {
     source_line_height_px: op.source_line_height_px || null,
     penpot_line_height_ratio: op.penpot_line_height_ratio || null,
     text_align: op.text_align || "left",
-    opacity: op.opacity === undefined ? 1 : op.opacity
+    opacity: op.opacity === undefined ? 1 : op.opacity,
+    text_no_wrap: op.text_no_wrap,
+    expected_line_count: op.expected_line_count,
+    source_line_count: op.source_line_count,
+    penpot_grow_type: op.penpot_grow_type
   };
 }
 
@@ -1284,7 +1318,8 @@ function finalizeImportJob(op) {
       var storedWeight = getPluginDataSafe(shape, "dvcp_font_weight") || shape.fontWeight || "400";
       setTextFill(shape, color, shape.opacity === undefined ? 1 : shape.opacity);
       applyDynamicFontWeight(shape, storedWeight);
-      trySet(shape, "growType", "fixed");
+      var storedGrow = getPluginDataSafe(shape, "dvcp_grow_type") || shape.growType || "fixed";
+      trySet(shape, "growType", storedGrow);
       textTouched++;
     }
   }
@@ -1513,7 +1548,7 @@ function applyImportOp(op) {
   if (!result.visual_materialization && op.op !== "create_root" && op.op !== "finalize_import_job") {
     result.visual_materialization = {
       schema: "dvcp.visual_materialization.v1",
-      version: "v06.12",
+      version: "v06.13",
       method: "native_fallback_legacy_path",
       visually_materialized: created.length > 0,
       fallback_used: true,
@@ -1554,8 +1589,13 @@ function applyImportOp(op) {
     if (op.font_family || op.source_font_family) setPluginDataSafe(shape, "source_font_family", op.source_font_family || op.font_family || "");
     if (op.source_line_height_px !== undefined) setPluginDataSafe(shape, "source_line_height_px", String(op.source_line_height_px));
     if (op.penpot_line_height_ratio !== undefined) setPluginDataSafe(shape, "penpot_line_height_ratio", String(op.penpot_line_height_ratio));
+    if (op.text_no_wrap !== undefined) setPluginDataSafe(shape, "text_no_wrap", String(op.text_no_wrap));
+    if (op.expected_line_count !== undefined) setPluginDataSafe(shape, "expected_line_count", String(op.expected_line_count));
+    if (op.source_line_count !== undefined) setPluginDataSafe(shape, "source_line_count", String(op.source_line_count));
+    var growTypeForShape = (String(shape.type || "").toLowerCase().indexOf("text") >= 0 || String(op.kind || "").toLowerCase() === "text" || String(op.kind || "").toLowerCase() === "icon") ? textGrowTypeFromOp(op) : "";
+    if (growTypeForShape) setPluginDataSafe(shape, "dvcp_grow_type", growTypeForShape);
     if (op.text) setPluginDataSafe(shape, "dvcp_text", String(op.text).slice(0, 300));
-    setPluginDataSafe(shape, "visual_materialization", "v06_12_icon_source_precedence");
+    setPluginDataSafe(shape, "visual_materialization", "v06_13_text_no_wrap_fidelity");
     if (result.visual_materialization) setPluginDataSafe(shape, "visual_materialization_detail", result.visual_materialization);
     result.created_shape_ids.push(getShapeId(shape));
     result.penpot_readback.push(compactShapeReadback(shape));

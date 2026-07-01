@@ -377,7 +377,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
     v06.4 exposed that many remaining visual drifts were introduced before
     Penpot: strokes/radii/footer height/action colors had been normalized by
     the LLM or tokens even though the Playwright source carried exact computed
-    values. v06.12 applies a deterministic precedence rule:
+    values. v06.13 applies a deterministic precedence rule:
 
         rendered source style > LLM planned value > token fallback > default
 
@@ -427,7 +427,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
                 # Keep planned text when it is not a reliable substring.
                 pass
         elif fidelity_kind == "icon":
-            # v06.12: distinguish true Material Symbol glyphs from inferred icon
+            # v06.13: distinguish true Material Symbol glyphs from inferred icon
             # slots. True glyphs must preserve the source font family and
             # ligature text; inferred slots should not inherit parent typography.
             is_material_symbol = bool(
@@ -471,7 +471,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         item["source_fidelity"] = {
             "schema": "dvcp.source_fidelity.v1",
             "mode": "computed_source_authority",
-            "version": "v06.12",
+            "version": "v06.13",
             "applied": bool(changed),
             "fidelity_kind": fidelity_kind,
             "copied_fields": changed,
@@ -480,8 +480,8 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         out.append(item)
     return out, {
         "schema": "dvcp.source_fidelity_summary.v1",
-        "version": "v06.12",
-        "strategy": "computed_source_style_authority_icon_source_precedence",
+        "version": "v06.13",
+        "strategy": "computed_source_style_authority_icon_source_precedence_text_no_wrap",
         "target_count": len(children),
         "planned_source_count": planned_count,
         "mode_counts": mode_counts,
@@ -521,7 +521,7 @@ def _attach_source_traces(children: list[dict[str, Any]], sources: list[dict[str
         "target_count": len(out),
         "matched_count": matched,
         "unmatched_count": unmatched,
-        "strategy": "bbox_text_kind_role_nearest_source_match_v06_12_icon_source_precedence",
+        "strategy": "bbox_text_kind_role_nearest_source_match_v06_13_text_no_wrap_fidelity",
     }
 
 
@@ -623,7 +623,7 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
 
 
 # -----------------------------------------------------------------------------
-# v06.12 deterministic Stitch -> Penpot transform
+# v06.13 deterministic Stitch -> Penpot transform
 # -----------------------------------------------------------------------------
 # Formal intent:
 #   S = set of rendered Stitch source elements
@@ -701,7 +701,7 @@ def _target_from_source(
         "slot": slot,
         "deterministic_transform": {
             "schema": "dvcp.deterministic_transform.v1",
-            "version": "v06.12",
+            "version": "v06.13",
             "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
             "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
             "source_domain": "StitchRenderedElement",
@@ -882,7 +882,7 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material
     rendered_icons_enabled = _rendered_import_icons_enabled()
     out: list[dict[str, Any]] = []
 
-    # v06.12: Material Symbols are text ligatures, but semantically they are
+    # v06.13: Material Symbols are text ligatures, but semantically they are
     # icon glyphs. Handle them before generic span/text mapping so Penpot gets
     # a create_icon op with the Material Symbols font instead of normal body text.
     if _is_material_symbol_glyph_source(source):
@@ -1091,7 +1091,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
 
     transform_summary = {
         "schema": "dvcp.deterministic_transform_summary.v1",
-        "version": "v06.12",
+        "version": "v06.13",
         "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
         "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
         "source_domain": "StitchRenderedElement",
@@ -1114,7 +1114,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "target_count": len(transformed),
         "matched_count": len(transformed),
         "unmatched_count": 0,
-        "strategy": "deterministic_transform_T_v06_12_source_to_penpot",
+        "strategy": "deterministic_transform_T_v06_13_source_to_penpot",
         "deterministic_transform": transform_summary,
         "source_fidelity": source_fidelity_summary,
     }
@@ -1137,7 +1137,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     spec["metadata"] = meta
     summary = {
         "used": False,
-        "reason": "deterministic_transform_T_v06_12",
+        "reason": "deterministic_transform_T_v06_13",
         "planner": "disabled_for_structure",
         "deterministic": True,
         "fallback_child_count": len(sources),
