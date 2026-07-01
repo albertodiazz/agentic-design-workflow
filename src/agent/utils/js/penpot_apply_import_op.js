@@ -352,7 +352,7 @@ function visualSvgForOp(op) {
     parts.push(svgTextFragment(opName + "_Glyph", iconTextFromOp(op), local, {
       color: iconColor,
       font_size: Math.max(asNumber(op.font_size, Math.min(w, h)), 10),
-      font_weight: op.font_weight || "400",
+      font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
       font_family: "Arial, sans-serif",
       line_height: Math.max(asNumber(op.font_size, Math.min(w, h)), 10) + 2,
       text_align: "center",
@@ -371,7 +371,7 @@ function visualSvgForOp(op) {
       parts.push(svgTextFragment(opName + "_Text", op.text, { x: 8, y: Math.max((b.height - 22) / 2, 4), width: Math.max(b.width - 16, 1), height: Math.max(Math.min(b.height, 26), 12) }, {
         color: op.color || (primary ? "#FFFFFF" : "#0F172A"),
         font_size: op.font_size || 15,
-        font_weight: op.font_weight || "600",
+        font_weight: normalizeFontWeight(op.font_weight || op.weight || "600"),
         font_family: op.font_family,
         line_height: op.line_height || 20,
         text_align: op.text_align || "center",
@@ -387,7 +387,7 @@ function visualSvgForOp(op) {
       parts.push(svgTextFragment(opName + "_Text", op.text, { x: 12, y: Math.max((b.height - 20) / 2, 4), width: Math.max(b.width - 24, 1), height: Math.max(Math.min(b.height, 24), 12) }, {
         color: op.color || "#64748B",
         font_size: Math.max(asNumber(op.font_size, 14), 10),
-        font_weight: op.font_weight || "400",
+        font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
         font_family: op.font_family,
         line_height: op.line_height || 20,
         text_align: op.text_align || "left",
@@ -404,7 +404,7 @@ function visualSvgForOp(op) {
       parts.push(svgTextFragment(opName + "_Text", op.text, { x: 12, y: 12, width: Math.max(b.width - 24, 1), height: Math.max(b.height - 24, 1) }, {
         color: op.color || "#0F172A",
         font_size: op.font_size || 14,
-        font_weight: op.font_weight || "400",
+        font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
         font_family: op.font_family,
         line_height: op.line_height || 20,
         text_align: op.text_align || "left",
@@ -470,7 +470,7 @@ function createVisualMaterializedShape(op, offset) {
   var svg = visualSvgForOp(op);
   var info = {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.9",
+    version: "v06.10",
     method: "svg_fallback",
     visually_materialized: false,
     fallback_used: false,
@@ -636,9 +636,73 @@ function normalizeFontFamily(value) {
   var lower = v.toLowerCase();
   if (lower.indexOf("material symbols") >= 0 || lower.indexOf("material icons") >= 0) return "";
   if (lower.indexOf("system-ui") >= 0 || lower.indexOf("sans-serif") >= 0) return "";
-  // v06.9: try to preserve the source family. If Penpot cannot resolve it, the
+  // v06.10: try to preserve the source family. If Penpot cannot resolve it, the
   // readback/report will record the fallback explicitly instead of hiding it.
   return v;
+}
+
+
+function normalizeFontWeight(value) {
+  if (value === undefined || value === null || value === "") return "400";
+  var raw = String(value).trim().toLowerCase();
+  var named = {
+    thin: 100, hairline: 100, extralight: 200, "extra-light": 200, ultralight: 200,
+    light: 300, regular: 400, normal: 400, book: 400, medium: 500,
+    semibold: 600, "semi-bold": 600, demibold: 600, "demi-bold": 600,
+    bold: 700, extrabold: 800, "extra-bold": 800, ultrabold: 800, black: 900, heavy: 900
+  };
+  var numeric = Number(raw.replace(/[^0-9.]/g, ""));
+  if (!Number.isFinite(numeric) || numeric <= 0) numeric = named[raw] || 400;
+  numeric = Math.round(numeric / 100) * 100;
+  if (numeric < 100) numeric = 100;
+  if (numeric > 900) numeric = 900;
+  return String(numeric);
+}
+
+function fontStyleNameFromWeight(value) {
+  var w = Number(normalizeFontWeight(value));
+  if (w >= 900) return "Black";
+  if (w >= 800) return "Extra Bold";
+  if (w >= 700) return "Bold";
+  if (w >= 600) return "Semi Bold";
+  if (w >= 500) return "Medium";
+  if (w <= 300) return "Light";
+  return "Regular";
+}
+
+function applyDynamicFontWeight(shape, weight) {
+  if (!shape) return false;
+  var normalized = normalizeFontWeight(weight);
+  var numeric = Number(normalized);
+  var styleName = fontStyleNameFromWeight(normalized);
+  var ok = false;
+  // Penpot builds differ: some honor numeric fontWeight, others switch by style.
+  // We never force "normal" here because that resets Inter 700 back to 400.
+  var variants = [numeric, normalized, styleName];
+  var props = ["fontWeight", "font-weight", "weight", "fontVariantWeight"];
+  for (var pi = 0; pi < props.length; pi++) {
+    for (var vi = 0; vi < variants.length; vi++) {
+      ok = trySet(shape, props[pi], variants[vi]) || ok;
+    }
+  }
+  var styleProps = ["fontStyle", "font-style", "fontVariant", "fontVariantName", "fontFace", "fontStyleName"];
+  for (var si = 0; si < styleProps.length; si++) {
+    ok = trySet(shape, styleProps[si], styleName) || ok;
+  }
+  if (typeof shape.setFontWeight === "function") {
+    try { shape.setFontWeight(numeric); ok = true; } catch (err1) {
+      try { shape.setFontWeight(normalized); ok = true; } catch (err2) {}
+    }
+  }
+  if (typeof shape.setFontStyle === "function") {
+    try { shape.setFontStyle(styleName); ok = true; } catch (err3) {}
+  }
+  if (typeof shape.setFontVariant === "function") {
+    try { shape.setFontVariant(styleName); ok = true; } catch (err4) {}
+  }
+  setPluginDataSafe(shape, "dvcp_font_weight", normalized);
+  setPluginDataSafe(shape, "dvcp_font_style", styleName);
+  return ok;
 }
 
 function sourceLineHeightPxFromOp(op, fontSize) {
@@ -729,7 +793,7 @@ function setTextStyle(shape, op) {
   op = op || {};
   var color = op.color || op.text_color || "#0F172A";
   var fontSize = Math.max(asNumber(op.font_size, 14), 1);
-  var fontWeight = String(op.font_weight || op.weight);
+  var fontWeight = normalizeFontWeight(op.font_weight || op.weight || "400");
   var align = normalizeTextAlign(op.text_align || "left");
   var sourceLineHeightPx = sourceLineHeightPxFromOp(op, fontSize);
   var lineHeightRatio = penpotLineHeightRatioFromOp(op, fontSize);
@@ -741,10 +805,9 @@ function setTextStyle(shape, op) {
   ok = trySet(shape, "verticalAlign", "top") || ok;
   ok = trySet(shape, "fontSize", String(fontSize)) || ok;
   ok = trySet(shape, "font-size", String(fontSize)) || ok;
-  ok = trySet(shape, "fontWeight", fontWeight) || ok;
-  ok = trySet(shape, "fontStyle", "normal") || ok;
   var normalizedFamily = normalizeFontFamily(op.font_family);
   if (normalizedFamily) ok = trySet(shape, "fontFamily", normalizedFamily) || ok;
+  ok = applyDynamicFontWeight(shape, fontWeight) || ok;
   ok = trySet(shape, "textAlign", align) || ok;
   ok = trySet(shape, "align", align) || ok;
   ok = trySet(shape, "lineHeight", String(lineHeightRatio)) || ok;
@@ -760,6 +823,9 @@ function setTextStyle(shape, op) {
   if (typeof shape.setFontFamily === "function" && normalizedFamily) {
     try { shape.setFontFamily(normalizedFamily); ok = true; } catch (err3) {}
   }
+  // Apply weight after family/size/text mutations. Some Penpot runtimes reset
+  // the selected style to Regular when family is applied.
+  ok = applyDynamicFontWeight(shape, fontWeight) || ok;
   return ok;
 }
 
@@ -917,7 +983,7 @@ function createIconShapes(op, offset) {
   var style = textStyleFromOp(Object.assign({}, op, {
     color: iconColor,
     font_size: fontSize,
-    font_weight: op.font_weight || "400",
+    font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
     font_family: "",
     text_align: "center",
     line_height: fontSize + 2,
@@ -936,7 +1002,7 @@ function nativeVisualInfo(op, method, created, error) {
   var expectedText = !!op.text;
   return {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.9",
+    version: "v06.10",
     method: method || "native_first",
     materialization_kind: "native_penpot_shapes",
     visually_materialized: created.length > 0,
@@ -1088,7 +1154,7 @@ function textStyleFromOp(op) {
   return {
     color: op.color || op.text_color || "#0F172A",
     font_size: op.font_size || 14,
-    font_weight: op.font_weight || "400",
+    font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
     font_family: op.font_family || null,
     source_font_family: op.source_font_family || op.font_family || null,
     line_height: op.line_height || null,
@@ -1182,7 +1248,9 @@ function finalizeImportJob(op) {
     var role = String(getPluginDataSafe(shape, "semantic_role") || "").toLowerCase();
     if (type.indexOf("text") >= 0 || kind === "text" || kind === "icon" || role.indexOf("text") >= 0 || role === "label" || role === "link" || role === "placeholder" || role.indexOf("icon") >= 0) {
       var color = getPluginDataSafe(shape, "dvcp_color") || shape.color || shape.textColor || "#0F172A";
+      var storedWeight = getPluginDataSafe(shape, "dvcp_font_weight") || shape.fontWeight || "400";
       setTextFill(shape, color, shape.opacity === undefined ? 1 : shape.opacity);
+      applyDynamicFontWeight(shape, storedWeight);
       trySet(shape, "growType", "fixed");
       textTouched++;
     }
@@ -1412,7 +1480,7 @@ function applyImportOp(op) {
   if (!result.visual_materialization && op.op !== "create_root" && op.op !== "finalize_import_job") {
     result.visual_materialization = {
       schema: "dvcp.visual_materialization.v1",
-      version: "v06.9",
+      version: "v06.10",
       method: "native_fallback_legacy_path",
       visually_materialized: created.length > 0,
       fallback_used: true,
@@ -1449,11 +1517,12 @@ function applyImportOp(op) {
     setPluginDataSafe(shape, "expected_visual", compactOpVisualValues(op));
     setLayerIndexData(shape, op, i);
     if (op.color || op.text_color) setPluginDataSafe(shape, "dvcp_color", op.color || op.text_color || "");
+    if (op.font_weight || op.weight) setPluginDataSafe(shape, "dvcp_font_weight", normalizeFontWeight(op.font_weight || op.weight || "400"));
     if (op.font_family || op.source_font_family) setPluginDataSafe(shape, "source_font_family", op.source_font_family || op.font_family || "");
     if (op.source_line_height_px !== undefined) setPluginDataSafe(shape, "source_line_height_px", String(op.source_line_height_px));
     if (op.penpot_line_height_ratio !== undefined) setPluginDataSafe(shape, "penpot_line_height_ratio", String(op.penpot_line_height_ratio));
     if (op.text) setPluginDataSafe(shape, "dvcp_text", String(op.text).slice(0, 300));
-    setPluginDataSafe(shape, "visual_materialization", "v06_9_text_fidelity");
+    setPluginDataSafe(shape, "visual_materialization", "v06_10_dynamic_text_style_bridge");
     if (result.visual_materialization) setPluginDataSafe(shape, "visual_materialization_detail", result.visual_materialization);
     result.created_shape_ids.push(getShapeId(shape));
     result.penpot_readback.push(compactShapeReadback(shape));

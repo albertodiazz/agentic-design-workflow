@@ -606,7 +606,7 @@ def _field_values_equal(field: str, expected: Any, actual: Any) -> bool:
     if field == "line_height":
         return abs(_num(actual, 0) - _num(expected, 0)) <= 0.75
     if field == "font_weight":
-        return _norm_cmp(expected) == _norm_cmp(actual)
+        return _normalise_font_weight(expected) == _normalise_font_weight(actual)
     if field in {"fill", "stroke", "color", "text_color"}:
         return _norm_cmp(expected).replace(" ", "") == _norm_cmp(actual).replace(" ", "")
     return _norm_cmp(expected) == _norm_cmp(actual)
@@ -623,7 +623,7 @@ def _line_height_values_equivalent(expected: Any, actual: Any, op_values: dict[s
     act = _num(actual, 0)
     if exp <= 0 and act <= 0:
         return True
-    # v06.9: CSS/source line-height may be px, while Penpot behaves more
+    # v06.10: CSS/source line-height may be px, while Penpot behaves more
     # predictably with a unitless ratio. If the source px is preserved in the
     # op, the mapping is faithful even when op.line_height is the Penpot ratio.
     src_px = _num(op_values.get("source_line_height_px"), 0)
@@ -643,6 +643,28 @@ def _normalise_font_name(value: Any) -> str:
     raw = raw.split(',')[0].strip()
     return re.sub(r"[^a-z0-9]+", "", raw)
 
+
+
+def _normalise_font_weight(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    names = {
+        "thin": 100, "hairline": 100, "extralight": 200, "extra-light": 200, "ultralight": 200,
+        "light": 300, "regular": 400, "normal": 400, "book": 400, "medium": 500,
+        "semibold": 600, "semi-bold": 600, "demibold": 600, "demi-bold": 600,
+        "bold": 700, "extrabold": 800, "extra-bold": 800, "ultrabold": 800, "black": 900, "heavy": 900,
+    }
+    m = re.search(r"\d+", raw)
+    if m:
+        n = int(m.group(0))
+    else:
+        n = names.get(raw, 0)
+    if not n:
+        return re.sub(r"[^a-z0-9]+", "", raw)
+    n = int(round(n / 100.0) * 100)
+    n = max(100, min(900, n))
+    return str(n)
 
 def _first_readback_text_style(readbacks: list[dict[str, Any]]) -> dict[str, Any]:
     for read in readbacks or []:
@@ -816,7 +838,7 @@ def _project_expected_for_slot(
             out.pop(key, None)
 
     elif slot_kind == "icon":
-        # v06.9: icon slots project the parent source into a glyph expectation.
+        # v06.10: icon slots project the parent source into a glyph expectation.
         # A source fill usually represents the input/button surface; the icon
         # paint should come from computed text color. This prevents false drifts
         # such as expected button fill vs actual white glyph.
@@ -847,7 +869,7 @@ def _project_expected_for_slot(
 
     return {
         "schema": "dvcp.source_slot_projection.v1",
-        "version": "v06.9",
+        "version": "v06.10",
         "source_ref": source_snapshot.get("source_ref"),
         "slot_kind": slot_kind,
         "slot": trace.get("slot"),
@@ -1023,10 +1045,10 @@ def _style_drift_diagnostics(
                     "autofixable": True,
                 })
 
-    # v06.9: readback font fidelity diagnostics. The op may faithfully carry
-    # Inter, while a local Penpot runtime falls back to Source Sans Pro. That is
-    # a visual-fidelity warning, not a structure/source mapping issue.
-    if "font_family" in fields and shape_ids:
+    # v06.10: readback font fidelity diagnostics. Family fallback is a warning,
+    # but weight mismatch is a real visual issue because Stitch explicitly
+    # specifies weights such as Inter 700 for headings.
+    if shape_ids and ({"font_family", "font_weight"} & set(fields)):
         rb_style = _first_readback_text_style(readback_normalized)
         actual_font = rb_style.get("fontFamily") if isinstance(rb_style, dict) else None
         expected_font = expected.get("font_family") or op_values.get("font_family") or op_values.get("source_font_family")
@@ -1040,15 +1062,27 @@ def _style_drift_diagnostics(
                 "message": "Penpot readback font differs from the source font; layout/content passed but font fidelity is approximate.",
                 "autofixable": False,
             })
-        if rb_style.get("fontWeight") is None and op_values.get("font_weight") is not None:
+        expected_weight = expected.get("font_weight") or op_values.get("font_weight")
+        actual_weight = rb_style.get("fontWeight") if isinstance(rb_style, dict) else None
+        if actual_weight is None and expected_weight is not None:
             warnings.append({
                 "category": "font_weight_readback_unavailable",
                 "field": "font_weight",
                 "severity": "info",
-                "expected": op_values.get("font_weight"),
+                "expected": expected_weight,
                 "actual": None,
                 "message": "Penpot readback did not expose fontWeight, so weight fidelity cannot be verified deterministically.",
                 "autofixable": False,
+            })
+        elif expected_weight is not None and actual_weight is not None and _normalise_font_weight(expected_weight) != _normalise_font_weight(actual_weight):
+            issues.append({
+                "category": "font_weight_mismatch",
+                "field": "font_weight",
+                "severity": "medium",
+                "expected": expected_weight,
+                "actual": actual_weight,
+                "message": "Penpot text weight differs from Stitch computed style; dynamic text style bridge should preserve the source weight.",
+                "autofixable": True,
             })
 
     high = sum(1 for issue in issues if issue.get("severity") == "high")
@@ -1161,7 +1195,7 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     report = {
         "schema": "dvcp.source_penpot_deterministic_report.v6",
         "mode": "source_map_no_llm",
-        "cleanup": "v06.9_text_fidelity_line_height_font_diagnostics",
+        "cleanup": "v06.10_dynamic_text_style_bridge",
         "mapping_count": len(mappings),
         "mapped_shape_count": mapped,
         "issue_count": real_issue_count,

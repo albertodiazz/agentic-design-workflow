@@ -353,7 +353,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
     v06.4 exposed that many remaining visual drifts were introduced before
     Penpot: strokes/radii/footer height/action colors had been normalized by
     the LLM or tokens even though the Playwright source carried exact computed
-    values. v06.9 applies a deterministic precedence rule:
+    values. v06.10 applies a deterministic precedence rule:
 
         rendered source style > LLM planned value > token fallback > default
 
@@ -403,7 +403,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
                 # Keep planned text when it is not a reliable substring.
                 pass
         elif fidelity_kind == "icon":
-            # v06.9: an icon slot represents a glyph, not its parent surface.
+            # v06.10: an icon slot represents a glyph, not its parent surface.
             # CSS `fill` on the source often means input/button background; the
             # glyph paint should come from computed text color. Keep the target
             # bbox/text, project glyph color deterministically, and drop
@@ -434,7 +434,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         item["source_fidelity"] = {
             "schema": "dvcp.source_fidelity.v1",
             "mode": "computed_source_authority",
-            "version": "v06.9",
+            "version": "v06.10",
             "applied": bool(changed),
             "fidelity_kind": fidelity_kind,
             "copied_fields": changed,
@@ -443,7 +443,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         out.append(item)
     return out, {
         "schema": "dvcp.source_fidelity_summary.v1",
-        "version": "v06.9",
+        "version": "v06.10",
         "strategy": "computed_source_style_authority_icon_slot_fidelity",
         "target_count": len(children),
         "planned_source_count": planned_count,
@@ -484,7 +484,7 @@ def _attach_source_traces(children: list[dict[str, Any]], sources: list[dict[str
         "target_count": len(out),
         "matched_count": matched,
         "unmatched_count": unmatched,
-        "strategy": "bbox_text_kind_role_nearest_source_match_v06_9_text_fidelity",
+        "strategy": "bbox_text_kind_role_nearest_source_match_v06_10_dynamic_text_style_bridge",
     }
 
 
@@ -586,7 +586,7 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
 
 
 # -----------------------------------------------------------------------------
-# v06.9 deterministic Stitch -> Penpot transform
+# v06.10 deterministic Stitch -> Penpot transform
 # -----------------------------------------------------------------------------
 # Formal intent:
 #   S = set of rendered Stitch source elements
@@ -664,7 +664,7 @@ def _target_from_source(
         "slot": slot,
         "deterministic_transform": {
             "schema": "dvcp.deterministic_transform.v1",
-            "version": "v06.9",
+            "version": "v06.10",
             "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
             "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
             "source_domain": "StitchRenderedElement",
@@ -946,7 +946,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
 
     transform_summary = {
         "schema": "dvcp.deterministic_transform_summary.v1",
-        "version": "v06.9",
+        "version": "v06.10",
         "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
         "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
         "source_domain": "StitchRenderedElement",
@@ -963,7 +963,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "target_count": len(transformed),
         "matched_count": len(transformed),
         "unmatched_count": 0,
-        "strategy": "deterministic_transform_T_v06_9_source_to_penpot",
+        "strategy": "deterministic_transform_T_v06_10_source_to_penpot",
         "deterministic_transform": transform_summary,
         "source_fidelity": source_fidelity_summary,
     }
@@ -986,7 +986,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     spec["metadata"] = meta
     summary = {
         "used": False,
-        "reason": "deterministic_transform_T_v06_9",
+        "reason": "deterministic_transform_T_v06_10",
         "planner": "disabled_for_structure",
         "deterministic": True,
         "fallback_child_count": len(sources),
