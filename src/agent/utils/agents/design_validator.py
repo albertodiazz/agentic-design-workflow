@@ -1170,56 +1170,80 @@ def semantic_layer_name_from_mapping(
     inferred_role: str,
     layer: dict[str, Any],
 ) -> str | None:
-    """Generate a canonical semantic name from compact DVCP visual mapping.
+    """Generate a generic semantic name from DVCP visual mapping.
 
-    This is intentionally deterministic. The LLM classifies and maps refs;
-    Python decides the concrete rename action.
+    This function must not assume a particular template such as a login screen.
+    It converts detected region/role/type into stable UI-oriented names like
+    `PrimaryButtonBackground`, `SearchInputLabelText`, `MetricCardBackground`,
+    `MainTableContainer`, etc.
     """
     region = str(visual_region or "").strip().lower()
     role = str(inferred_role or "").strip().lower()
     current_name = str(layer.get("name") or "").strip().lower()
     layer_type = str(layer.get("type") or "").strip().lower()
-    combined = f"{region} {role} {current_name}"
+    text_value = str(layer.get("text") or "").strip().lower()
+    combined = f"{region} {role} {current_name} {text_value}"
 
     is_text = "text" in layer_type or "text" in role or "label" in role or "heading" in role
-    is_shape = any(token in layer_type for token in ["rect", "shape", "path", "ellipse"])
+    is_shape = any(token in layer_type for token in ["rect", "shape", "path", "ellipse", "board", "frame", "group"])
 
-    if "email" in combined:
-        if "label" in combined or (is_text and "background" not in combined):
-            return "EmailInputLabelText"
-        if is_shape or "background" in combined or "input" in combined:
-            return "EmailInputBackground"
+    def has_any(tokens: list[str]) -> bool:
+        return any(token in combined for token in tokens)
 
-    if "password" in combined or "contraseña" in combined:
-        if "label" in combined or (is_text and "background" not in combined):
-            return "PasswordInputLabelText"
-        if is_shape or "background" in combined or "input" in combined:
-            return "PasswordInputBackground"
+    def variant(default: str = "Main") -> str:
+        candidates = [
+            ("primary", "Primary"), ("secondary", "Secondary"), ("danger", "Danger"),
+            ("submit", "Submit"), ("save", "Save"), ("search", "Search"),
+            ("email", "Email"), ("password", "Password"), ("filter", "Filter"),
+            ("metric", "Metric"), ("product", "Product"), ("profile", "Profile"),
+            ("sidebar", "Sidebar"), ("header", "Header"), ("footer", "Footer"),
+            ("table", "Table"), ("chart", "Chart"), ("card", "Card"),
+        ]
+        for token, label in candidates:
+            if token in combined:
+                return label
+        source = region or role or current_name or default
+        return pascal_case(source)[:48] or default
 
-    if "title" in combined or "heading" in combined:
-        return "LoginTitleText"
+    v = variant()
 
-    if "button" in combined or "iniciar" in combined:
-        if "button_text" in combined or (is_text and "background" not in combined):
-            return "LoginButtonText"
-        if is_shape or "background" in combined or "button" in combined:
-            return "LoginButtonBackground"
+    if has_any(["button", "btn", "cta", "submit"]):
+        return f"{v}ButtonText" if is_text else f"{v}ButtonBackground"
 
-    if "login" in combined and ("button" in combined or "submit" in combined):
-        if is_text and "background" not in combined:
-            return "LoginButtonText"
-        if is_shape or "background" in combined:
-            return "LoginButtonBackground"
+    if has_any(["input", "field", "textbox", "search", "email", "password", "select"]):
+        if is_text or "label" in combined or "placeholder" in combined:
+            return f"{v}InputLabelText"
+        return f"{v}InputBackground"
 
-    if "card" in combined or "container" in combined or "background" in combined:
-        if not is_text:
-            return "LoginCardBackground"
+    if has_any(["checkbox", "radio", "toggle", "switch"]):
+        return f"{v}ControlLabelText" if is_text else f"{v}ControlBackground"
+
+    if has_any(["card", "tile", "panel"]):
+        return f"{v}CardText" if is_text else f"{v}CardBackground"
+
+    if has_any(["table", "row", "column", "cell"]):
+        return f"{v}TableText" if is_text else f"{v}TableContainer"
+
+    if has_any(["chart", "graph", "metric", "kpi", "stat"]):
+        return f"{v}DataText" if is_text else f"{v}DataVizContainer"
+
+    if has_any(["nav", "sidebar", "menu", "tab", "breadcrumb"]):
+        return f"{v}NavigationText" if is_text else f"{v}NavigationContainer"
+
+    if has_any(["image", "avatar", "photo", "thumbnail", "icon", "logo"]):
+        return f"{v}MediaText" if is_text else f"{v}Media"
+
+    if has_any(["title", "heading", "headline", "h1", "h2"]):
+        return f"{v}HeadingText"
+
+    if has_any(["container", "frame", "board", "surface", "background"]):
+        return f"{v}Container" if not is_text else f"{v}Text"
 
     if role:
         base = pascal_case(role)
         if is_text and not base.endswith("Text"):
             base += "Text"
-        if is_shape and not base.endswith(("Background", "Container")):
+        if is_shape and not base.endswith(("Background", "Container", "Frame")):
             base += "Background"
         return base
 
@@ -1459,10 +1483,9 @@ def _dvcp_has_all(parts: list[str], text: str) -> bool:
 def compact_native_library_evidence(library: Any) -> dict[str, Any]:
     """Return compact native Penpot Assets/Tokens evidence for DVCP prompt.
 
-    DVCP/0.3 keeps explicit evidence for native interactive state assets.
-    Penpot may expose hierarchical asset names as leaf names in the library;
-    therefore we also preserve plugin metadata written by the semantic executor
-    (`dvcp.full_name`, `dvcp.semantic_role`, `dvcp.states`).
+    Pattern-agnostic version. It detects whether the library contains reusable
+    components, interactive state assets, focus evidence and complete token sets
+    without assuming login-specific names like Email/Password/Button Primary.
     """
     if not isinstance(library, dict):
         return {
@@ -1477,7 +1500,7 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
         if not isinstance(token_set, dict):
             continue
         tokens_out: list[dict[str, Any]] = []
-        for token in (token_set.get("tokens") or [])[:120]:
+        for token in (token_set.get("tokens") or [])[:160]:
             if not isinstance(token, dict):
                 continue
             tokens_out.append({
@@ -1492,7 +1515,7 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
         })
 
     components_out: list[dict[str, Any]] = []
-    for component in (library.get("components") or [])[:160]:
+    for component in (library.get("components") or [])[:220]:
         if not isinstance(component, dict):
             continue
         full_name = (
@@ -1535,54 +1558,59 @@ def compact_native_library_evidence(library: Any) -> dict[str, Any]:
         " / ".join(component_full_names + component_names + component_semantic_roles + [str(item.get("dvcp_states") or "") for item in components_out])
     )
     normalized_tokens = _dvcp_normalize_evidence_name(" / ".join(token_names))
-
     reader_evidence = library.get("interactive_state_evidence") if isinstance(library.get("interactive_state_evidence"), dict) else {}
-    interactive_state_evidence = {
-        "has_email_input": bool(reader_evidence.get("has_email_input")) or _dvcp_has_all(["textinput", "email"], normalized_components) or _dvcp_has_all(["email", "input"], normalized_components),
-        "has_password_input": bool(reader_evidence.get("has_password_input")) or _dvcp_has_all(["textinput", "password"], normalized_components) or _dvcp_has_all(["password", "input"], normalized_components),
-        "has_primary_button": bool(reader_evidence.get("has_primary_button")) or _dvcp_has_all(["button", "primary"], normalized_components),
-        "has_email_focus": bool(reader_evidence.get("has_email_focus")) or _dvcp_has_all(["email", "focus"], normalized_components),
-        "has_password_focus": bool(reader_evidence.get("has_password_focus")) or _dvcp_has_all(["password", "focus"], normalized_components),
-        "has_button_focus": bool(reader_evidence.get("has_button_focus")) or _dvcp_has_all(["button", "focus"], normalized_components) or _dvcp_has_all(["primary", "focus"], normalized_components),
-        "has_button_hover": bool(reader_evidence.get("has_button_hover")) or _dvcp_has_all(["button", "hover"], normalized_components) or _dvcp_has_all(["primary", "hover"], normalized_components),
-        "has_button_disabled": bool(reader_evidence.get("has_button_disabled")) or _dvcp_has_all(["button", "disabled"], normalized_components) or _dvcp_has_all(["primary", "disabled"], normalized_components),
+
+    def has_word(word: str) -> bool:
+        return _dvcp_normalize_evidence_name(word) in normalized_components
+
+    component_count = len([c for c in components_out if c.get("name") or c.get("full_name")])
+    interactive_component_count = len([
+        c for c in components_out
+        if any(term in _dvcp_normalize_evidence_name(" ".join([str(c.get("full_name") or ""), str(c.get("semantic_role") or ""), str(c.get("dvcp_states") or "")])) for term in ["button", "input", "control", "select", "toggle", "navigation", "tab", "menu"])
+    ])
+
+    evidence = {
+        "component_count": component_count,
+        "interactive_component_count": interactive_component_count,
+        "has_input_component": bool(reader_evidence.get("has_input_component")) or has_word("input") or has_word("field") or has_word("textinput"),
+        "has_button_component": bool(reader_evidence.get("has_button_component")) or has_word("button") or has_word("cta"),
+        "has_control_component": bool(reader_evidence.get("has_control_component")) or has_word("control") or has_word("checkbox") or has_word("toggle") or has_word("radio"),
+        "has_navigation_component": bool(reader_evidence.get("has_navigation_component")) or has_word("navigation") or has_word("sidebar") or has_word("menu") or has_word("tab"),
+        "has_card_component": bool(reader_evidence.get("has_card_component")) or has_word("card") or has_word("surface") or has_word("panel"),
+        "has_table_component": bool(reader_evidence.get("has_table_component")) or has_word("table") or has_word("row") or has_word("cell"),
+        "has_focus_state": bool(reader_evidence.get("has_focus_state")) or has_word("focus"),
+        "has_hover_state": bool(reader_evidence.get("has_hover_state")) or has_word("hover"),
+        "has_disabled_state": bool(reader_evidence.get("has_disabled_state")) or has_word("disabled"),
         "has_focus_tokens": bool(reader_evidence.get("has_focus_tokens")) or "colorfocusring" in normalized_tokens or "borderfocuswidth" in normalized_tokens,
         "has_interactive_color_tokens": bool(reader_evidence.get("has_interactive_color_tokens")) or ("hover" in normalized_tokens and "disabled" in normalized_tokens),
-        "has_spacing_tokens": bool(reader_evidence.get("has_spacing_tokens")) or "spacingformgap" in normalized_tokens or "spacinginputpaddingx" in normalized_tokens,
+        "has_spacing_tokens": bool(reader_evidence.get("has_spacing_tokens")) or "spacingformgap" in normalized_tokens or "spacinginputpaddingx" in normalized_tokens or "spacing24" in normalized_tokens,
+        "has_typography_tokens": bool(reader_evidence.get("has_typography_tokens")) or "typographyheading" in normalized_tokens or "typographybody" in normalized_tokens,
     }
-    interactive_state_evidence["all_focus_states"] = (
-        interactive_state_evidence["has_email_focus"]
-        and interactive_state_evidence["has_password_focus"]
-        and interactive_state_evidence["has_button_focus"]
-    )
-    interactive_state_evidence["all_button_states"] = (
-        interactive_state_evidence["has_button_hover"]
-        and interactive_state_evidence["has_button_disabled"]
-        and interactive_state_evidence["has_button_focus"]
-    )
-    interactive_state_evidence["interactive_tokens_complete"] = (
-        interactive_state_evidence["has_focus_tokens"]
-        and interactive_state_evidence["has_interactive_color_tokens"]
-    )
-    interactive_state_evidence["component_states_complete"] = (
-        interactive_state_evidence["all_focus_states"]
-        and interactive_state_evidence["all_button_states"]
-    )
+    evidence["interactive_tokens_complete"] = evidence["has_focus_tokens"] and evidence["has_interactive_color_tokens"]
+    evidence["focus_complete"] = evidence["has_focus_state"] and evidence["has_focus_tokens"]
+    evidence["button_states_complete"] = evidence["has_button_component"] and evidence["has_hover_state"] and evidence["has_disabled_state"]
+    # Generic component state completeness: there is at least one interactive component with focus metadata,
+    # plus button hover/disabled when a button component exists.
+    evidence["component_states_complete"] = evidence["focus_complete"] and (not evidence["has_button_component"] or evidence["button_states_complete"])
+    evidence["tokens_complete"] = evidence["interactive_tokens_complete"] and evidence["has_spacing_tokens"] and evidence["has_typography_tokens"]
+
+    # Backward-compatible aliases used by existing report post-processing.
+    evidence["all_focus_states"] = evidence["focus_complete"]
+    evidence["all_button_states"] = evidence["button_states_complete"]
 
     return {
         "available": bool(library.get("available")),
         "token_sets": token_sets_out,
         "token_set_names": token_set_names,
-        "token_names": token_names[:240],
+        "token_names": token_names[:260],
         "components": components_out,
-        "component_names": component_names[:240],
-        "component_full_names": component_full_names[:240],
-        "component_semantic_roles": component_semantic_roles[:240],
-        "interactive_state_evidence": interactive_state_evidence,
+        "component_names": component_names[:260],
+        "component_full_names": component_full_names[:260],
+        "component_semantic_roles": component_semantic_roles[:260],
+        "interactive_state_evidence": evidence,
         "colors": [item.get("name", "") for item in (library.get("colors") or [])[:40] if isinstance(item, dict)],
         "typographies": [item.get("name", "") for item in (library.get("typographies") or [])[:40] if isinstance(item, dict)],
     }
-
 
 
 def apply_native_interactive_evidence_to_report(
@@ -1658,7 +1686,7 @@ def apply_native_interactive_evidence_to_report(
             "accessibility",
             85,
             "pass",
-            "Estados de focus nativos detectados para inputs y botón.",
+            "Estados de focus nativos detectados para componentes interactivos.",
         )
 
     elif focus_complete:
@@ -1726,7 +1754,7 @@ def apply_native_interactive_evidence_to_report(
         ]
         component_terms = [
             "componente", "componentes", "component", "components",
-            "asset", "assets", "textinput", "button/primary",
+            "asset", "assets", "textinput", "button/primary", "button", "input", "control",
         ]
 
         is_interaction_fix = any(term in text for term in interaction_terms)
@@ -1738,7 +1766,7 @@ def apply_native_interactive_evidence_to_report(
             return True
         if focus_complete and "focus" in text:
             return True
-        if button_states_complete and any(term in text for term in ["hover", "disabled", "disable", "button/primary", "boton"]):
+        if button_states_complete and any(term in text for term in ["hover", "disabled", "disable", "button/primary", "button", "input", "control", "boton"]):
             return True
         if tokens_complete and (is_token_fix or is_spacing_fix):
             return True

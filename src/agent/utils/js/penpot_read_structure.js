@@ -137,7 +137,7 @@ function serializeShape(shape, depth, path) {
     fontFamily: shape.fontFamily ? String(shape.fontFamily) : null,
     fontSize: asNumber(shape.fontSize),
     fontWeight: shape.fontWeight ? String(shape.fontWeight) : null,
-    lineHeight: shape.lineHeight ? safePlain(shape.lineHeight, 4) : null,
+    lineHeight: 1.2,
 
     componentId: shape.componentId ? String(shape.componentId) : null,
     componentName: shape.component && shape.component.name ? String(shape.component.name) : null,
@@ -298,24 +298,58 @@ function readLibrarySummary() {
     return true;
   }
 
+  function hasAny(parts, text) {
+    for (var i = 0; i < parts.length; i++) {
+      if (text.indexOf(normalizeEvidenceName(parts[i])) >= 0) return true;
+    }
+    return false;
+  }
+
+  var hasFocusState = hasAny(["focus"], normalizedComponents);
+  var hasHoverState = hasAny(["hover"], normalizedComponents);
+  var hasDisabledState = hasAny(["disabled", "disable"], normalizedComponents);
+  var hasButtonComponent = hasAny(["button", "btn", "cta", "primary"], normalizedComponents);
+  var hasInputComponent = hasAny(["input", "field", "textinput", "textbox", "search", "select"], normalizedComponents);
+  var hasControlComponent = hasAny(["control", "checkbox", "radio", "toggle", "switch"], normalizedComponents);
+  var hasNavigationComponent = hasAny(["navigation", "nav", "sidebar", "menu", "tab", "breadcrumb"], normalizedComponents);
+  var hasCardComponent = hasAny(["card", "surface", "panel", "tile"], normalizedComponents);
+  var hasTableComponent = hasAny(["table", "row", "cell", "grid"], normalizedComponents);
+  var hasFocusTokens = normalizedTokens.indexOf("color.focus.ring") >= 0 || normalizedTokens.indexOf("colorfocusring") >= 0 || normalizedTokens.indexOf("borderfocuswidth") >= 0;
+  var hasInteractiveColorTokens = normalizedTokens.indexOf("hover") >= 0 && normalizedTokens.indexOf("disabled") >= 0;
+  var hasSpacingTokens = normalizedTokens.indexOf("spacing.form.gap") >= 0 || normalizedTokens.indexOf("spacingformgap") >= 0 || normalizedTokens.indexOf("spacing.input.padding.x") >= 0 || normalizedTokens.indexOf("spacinginputpaddingx") >= 0 || normalizedTokens.indexOf("spacing24") >= 0;
+  var hasTypographyTokens = normalizedTokens.indexOf("typography.heading") >= 0 || normalizedTokens.indexOf("typographyheading") >= 0 || normalizedTokens.indexOf("typography.body") >= 0 || normalizedTokens.indexOf("typographybody") >= 0;
+
   summary.interactive_state_evidence = {
-    has_email_input: hasAll(["textinput", "email"], normalizedComponents) || hasAll(["email", "input"], normalizedComponents),
-    has_password_input: hasAll(["textinput", "password"], normalizedComponents) || hasAll(["password", "input"], normalizedComponents),
-    has_primary_button: hasAll(["button", "primary"], normalizedComponents) || normalizedComponents.indexOf("primary") >= 0,
-    has_email_focus: hasAll(["email", "focus"], normalizedComponents),
-    has_password_focus: hasAll(["password", "focus"], normalizedComponents),
-    has_button_focus: hasAll(["button", "focus"], normalizedComponents) || hasAll(["primary", "focus"], normalizedComponents),
-    has_button_hover: hasAll(["button", "hover"], normalizedComponents) || hasAll(["primary", "hover"], normalizedComponents),
-    has_button_disabled: hasAll(["button", "disabled"], normalizedComponents) || hasAll(["primary", "disabled"], normalizedComponents),
-    has_focus_tokens: normalizedTokens.indexOf("color.focus.ring") >= 0 || normalizedTokens.indexOf("colorfocusring") >= 0,
-    has_interactive_color_tokens: (normalizedTokens.indexOf("hover") >= 0 && normalizedTokens.indexOf("disabled") >= 0),
-    has_spacing_tokens: normalizedTokens.indexOf("spacing.form.gap") >= 0 || normalizedTokens.indexOf("spacingformgap") >= 0,
+    pattern_agnostic: true,
+    component_count: summary.components.length,
+    interactive_component_count: summary.components.filter(function (component) {
+      var ctext = normalizeEvidenceName([component.full_name, component.path, component.name, component.semantic_role, component.dvcpStatesSerialized].join(" /"));
+      return hasAny(["button", "input", "field", "control", "select", "toggle", "navigation", "tab", "menu"], ctext);
+    }).length,
+    has_input_component: hasInputComponent,
+    has_button_component: hasButtonComponent,
+    has_control_component: hasControlComponent,
+    has_navigation_component: hasNavigationComponent,
+    has_card_component: hasCardComponent,
+    has_table_component: hasTableComponent,
+    has_focus_state: hasFocusState,
+    has_hover_state: hasHoverState,
+    has_disabled_state: hasDisabledState,
+    has_focus_tokens: hasFocusTokens,
+    has_interactive_color_tokens: hasInteractiveColorTokens,
+    has_spacing_tokens: hasSpacingTokens,
+    has_typography_tokens: hasTypographyTokens,
     normalized_component_text: normalizedComponents.slice(0, 2000),
     normalized_token_text: normalizedTokens.slice(0, 2000)
   };
-  summary.interactive_state_evidence.all_focus_states = summary.interactive_state_evidence.has_email_focus && summary.interactive_state_evidence.has_password_focus && summary.interactive_state_evidence.has_button_focus;
-  summary.interactive_state_evidence.all_button_states = summary.interactive_state_evidence.has_button_hover && summary.interactive_state_evidence.has_button_disabled && summary.interactive_state_evidence.has_button_focus;
-  summary.interactive_state_evidence.interactive_tokens_complete = summary.interactive_state_evidence.has_focus_tokens && summary.interactive_state_evidence.has_interactive_color_tokens;
+  summary.interactive_state_evidence.focus_complete = hasFocusState && hasFocusTokens;
+  summary.interactive_state_evidence.button_states_complete = hasButtonComponent && hasHoverState && hasDisabledState;
+  summary.interactive_state_evidence.interactive_tokens_complete = hasFocusTokens && hasInteractiveColorTokens;
+  summary.interactive_state_evidence.tokens_complete = summary.interactive_state_evidence.interactive_tokens_complete && hasSpacingTokens && hasTypographyTokens;
+  summary.interactive_state_evidence.component_states_complete = summary.interactive_state_evidence.focus_complete && (!hasButtonComponent || summary.interactive_state_evidence.button_states_complete);
+  // Backward-compatible aliases for previous login-specific code paths.
+  summary.interactive_state_evidence.all_focus_states = summary.interactive_state_evidence.focus_complete;
+  summary.interactive_state_evidence.all_button_states = summary.interactive_state_evidence.button_states_complete;
 
   return summary;
 }

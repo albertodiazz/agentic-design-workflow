@@ -29,6 +29,32 @@ from agent.utils.resource_loader import (
     load_js,
     read_skill,
 )
+from agent.utils.stitch_external_design import build_external_design_spec_from_stitch
+from agent.utils.stitch_mcp_client import fetch_existing_stitch_screen
+from agent.utils.stitch_import_queue import (
+    aggregate_stitch_import_queue_results,
+    build_stitch_import_queue,
+    compact_imported_design_spec_for_output,
+)
+from agent.utils.stitch_llm_memory import (
+    build_stitch_llm_memory,
+    build_stitch_llm_planner_messages,
+    build_stitch_visual_diff_messages,
+    compact_memory_for_output,
+    compact_visual_nodes_for_diff,
+    parse_visual_diff_report,
+)
+from agent.utils.stitch_llm_planner import (
+    build_external_design_spec_from_deterministic_transform,
+    build_external_design_spec_from_llm_plan,
+    parse_llm_build_plan,
+    sanitize_external_design_spec_for_import,
+)
+from agent.utils.penpot_image_export import (
+    assert_valid_png_base64,
+    extract_png_base64_from_export_shape,
+    png_base64_to_data_url,
+)
 
 from agent.utils.fixer_prompt import (
     canvas_auto_fix_enabled,
@@ -58,6 +84,7 @@ Action = Literal[
     "validate_and_fix",
     "validate_and_polish",
     "build_validate_and_fix",
+    "import_from_stitch",
 ]
 
 
@@ -72,7 +99,22 @@ def normalize_action(action: str | None) -> str:
         "validate_and_fix",
         "validate_and_polish",
         "build_validate_and_fix",
+        "import_from_stitch",
     }
+
+    # Backwards-compatible aliases from older debug builds.
+    # Public Stitch UX is intentionally a single action: import_from_stitch.
+    stitch_aliases = {
+        "import_from_stitch_and_validate",
+        "import_from_stitch_queue",
+        "import_from_stitch_queue_and_validate",
+        "prepare_stitch_import_queue",
+        "run_stitch_import_queue",
+        "resume_stitch_import_queue",
+        "import_from_stitch_llm_guided",
+    }
+    if action in stitch_aliases:
+        return "import_from_stitch"
 
     if action not in allowed_actions:
         return "build_and_validate"
@@ -107,6 +149,19 @@ def action_allows_fixing(action: str) -> bool:
 
 def action_is_polish(action: str) -> bool:
     return action == "validate_and_polish"
+
+
+def action_imports_from_stitch(action: str) -> bool:
+    # Public Stitch UX: one action only. Queue/LLM/rendered/visual steps are internal.
+    return action == "import_from_stitch"
+
+
+def action_requires_validation_after_import(action: str) -> bool:
+    # Import has its own internal plan/execution summary. Run the normal validator
+    # only when explicitly enabled to avoid surprising writes/loops after import.
+    if action != "import_from_stitch":
+        return False
+    return os.getenv("STITCH_IMPORT_RUN_VALIDATOR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------
@@ -211,6 +266,10 @@ class InputState(TypedDict, total=False):
     changeme: str
     action: Action
     max_fix_iterations: int
+    stitch_project_id: str
+    stitch_project_name: str
+    stitch_screen_id: str
+    stitch_screen_name: str
 
 
 class OutputState(TypedDict, total=False):
@@ -235,6 +294,21 @@ class OutputState(TypedDict, total=False):
     auto_fix_verification: dict[str, Any] | None
 
     semantic_auto_fix_result: dict[str, Any] | None
+
+    stitch_import_result: dict[str, Any] | None
+    imported_design_spec: dict[str, Any] | None
+    stitch_import_queue: dict[str, Any] | None
+    stitch_import_queue_result: dict[str, Any] | None
+    stitch_llm_memory: dict[str, Any] | None
+    stitch_llm_plan_summary: dict[str, Any] | None
+    stitch_visual_diff_report: dict[str, Any] | None
+    stitch_source_trace_report: dict[str, Any] | None
+    stitch_source_to_penpot_map: list[dict[str, Any]] | None
+
+    stitch_project_id: str | None
+    stitch_project_name: str | None
+    stitch_screen_id: str | None
+    stitch_screen_name: str | None
 
 
 class OverallState(MessagesState, total=False):
@@ -267,6 +341,19 @@ class OverallState(MessagesState, total=False):
     last_semantic_fix_plan: NotRequired[list[dict[str, Any]]]
     canvas_auto_fix_result: NotRequired[dict[str, Any]]
     semantic_auto_fix_result: NotRequired[dict[str, Any]]
+    stitch_import_result: NotRequired[dict[str, Any]]
+    imported_design_spec: NotRequired[dict[str, Any]]
+    stitch_import_queue: NotRequired[dict[str, Any]]
+    stitch_import_queue_result: NotRequired[dict[str, Any]]
+    stitch_llm_memory: NotRequired[dict[str, Any]]
+    stitch_llm_plan_summary: NotRequired[dict[str, Any]]
+    stitch_visual_diff_report: NotRequired[dict[str, Any] | None]
+    stitch_source_trace_report: NotRequired[dict[str, Any] | None]
+    stitch_source_to_penpot_map: NotRequired[list[dict[str, Any]] | None]
+    stitch_project_id: NotRequired[str | None]
+    stitch_project_name: NotRequired[str | None]
+    stitch_screen_id: NotRequired[str | None]
+    stitch_screen_name: NotRequired[str | None]
     post_fix_validation_mode: NotRequired[str | None]
     auto_fix_verified: NotRequired[bool]
     auto_fix_event: NotRequired[dict[str, Any] | None]
@@ -385,6 +472,161 @@ def content_to_text(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, default=str)
 
 
+def merge_metered_usage_updates(
+    state: dict[str, Any],
+    current_updates: dict[str, Any],
+    metered_result: Any,
+) -> dict[str, Any]:
+    """Accumulate LLM usage across multiple metered calls in one node."""
+    usage_state = {
+        "input_tokens": current_updates.get("input_tokens", state.get("input_tokens", 0)),
+        "output_tokens": current_updates.get("output_tokens", state.get("output_tokens", 0)),
+        "total_tokens": current_updates.get("total_tokens", state.get("total_tokens", 0)),
+    }
+    current_updates.update(usage_updates_from_metered_result(usage_state, metered_result))
+    return current_updates
+
+
+def stitch_visual_diff_enabled() -> bool:
+    return os.getenv("STITCH_IMPORT_VISUAL_DIFF", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def make_visual_diff_status(
+    status: str,
+    *,
+    reason: str | None = None,
+    error: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report = {
+        "schema": "dvcp.stitch_visual_diff_report.v1",
+        "status": status,
+        "mode": "report_only",
+        "compared_at": utc_now_iso(),
+        "issues": [],
+    }
+    if reason:
+        report["reason"] = reason
+    if error:
+        report["error"] = error
+    if extra:
+        report.update(extra)
+    return report
+
+
+def root_shape_id_from_import_job(job: dict[str, Any]) -> str | None:
+    for result in job.get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        if result.get("op") == "create_root":
+            ids = result.get("created_shape_ids") or []
+            if ids:
+                return str(ids[0])
+    ids = job.get("created_shape_ids") or []
+    return str(ids[0]) if ids else None
+
+
+def compact_queue_summary_for_visual_diff(queue_result: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "all_applied", "status", "total_ops", "created_shape_count",
+        "failed_count", "component_assembly_summary", "visual_materialization_summary",
+    ]
+    return {key: queue_result.get(key) for key in keys if key in queue_result}
+
+
+async def build_stitch_visual_diff_report(
+    *,
+    state: OverallState,
+    job: dict[str, Any],
+    spec: dict[str, Any] | None,
+    stitch_memory: dict[str, Any] | None,
+    queue_result: dict[str, Any],
+    export_shape_tool: Any | None,
+    token_updates: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Export the imported Penpot root and ask the LLM for a visual diff report.
+
+    This is intentionally report-only. It never applies fixes and never changes
+    the imported design. It is enabled by default and can be disabled with
+    STITCH_IMPORT_VISUAL_DIFF=0.
+    """
+    if not stitch_visual_diff_enabled():
+        return make_visual_diff_status("skipped", reason="disabled_by_STITCH_IMPORT_VISUAL_DIFF"), token_updates
+
+    reference_data_url = str((((stitch_memory or {}).get("reference_image") or {}).get("data_url") or ""))
+    if not reference_data_url:
+        return make_visual_diff_status("skipped", reason="reference_stitch_screenshot_unavailable"), token_updates
+
+    if export_shape_tool is None:
+        return make_visual_diff_status("skipped", reason="export_shape_not_available"), token_updates
+
+    shape_id = os.getenv("STITCH_IMPORT_VISUAL_DIFF_SHAPE_ID", "").strip() or root_shape_id_from_import_job(job)
+    if not shape_id:
+        return make_visual_diff_status("skipped", reason="imported_root_shape_id_unavailable"), token_updates
+
+    try:
+        export_result = await export_shape_tool.ainvoke({"shapeId": shape_id, "format": "png", "mode": "shape"})
+        penpot_b64 = extract_png_base64_from_export_shape(export_result)
+        if not penpot_b64:
+            return make_visual_diff_status(
+                "error",
+                error="export_shape_returned_no_png_base64",
+                extra={"shape_id": shape_id},
+            ), token_updates
+        assert_valid_png_base64(penpot_b64)
+        penpot_data_url = png_base64_to_data_url(penpot_b64)
+    except Exception as exc:  # noqa: BLE001
+        return make_visual_diff_status(
+            "error",
+            error=f"penpot_export_failed: {exc!r}",
+            extra={"shape_id": shape_id},
+        ), token_updates
+
+    screen_summary = {
+        "screen_name": (spec or {}).get("screen_name") if isinstance(spec, dict) else job.get("screen_name"),
+        "screen_title": (spec or {}).get("screen_title") if isinstance(spec, dict) else job.get("screen_title"),
+        "screen_type": (spec or {}).get("screen_type") if isinstance(spec, dict) else job.get("screen_type"),
+        "width": (spec or {}).get("width") if isinstance(spec, dict) else job.get("width"),
+        "height": (spec or {}).get("height") if isinstance(spec, dict) else job.get("height"),
+        "tokens": (spec or {}).get("tokens", {}) if isinstance(spec, dict) else {},
+        "exported_shape_id": shape_id,
+    }
+    visual_nodes = compact_visual_nodes_for_diff(job, spec)
+    messages = build_stitch_visual_diff_messages(
+        reference_image_data_url=reference_data_url,
+        penpot_image_data_url=penpot_data_url,
+        screen_summary=screen_summary,
+        visual_nodes=visual_nodes,
+        queue_summary=compact_queue_summary_for_visual_diff(queue_result),
+    )
+
+    try:
+        metered = await metered_ainvoke(
+            llm,
+            messages,
+            estimated_completion_tokens=int(os.getenv("STITCH_IMPORT_VISUAL_DIFF_COMPLETION_TOKENS", "2400")),
+        )
+        token_updates = merge_metered_usage_updates(state, token_updates, metered)
+        report = parse_visual_diff_report(content_to_text(metered.ai_message.content))
+        report.setdefault("mode", "report_only")
+        report.setdefault("compared_at", utc_now_iso())
+        report["export"] = {
+            "shape_id": shape_id,
+            "format": "png",
+            "reference_image_available": True,
+            "penpot_image_base64_length": len(penpot_b64),
+        }
+        report["node_count"] = len(visual_nodes)
+        report["queue_summary"] = compact_queue_summary_for_visual_diff(queue_result)
+        return report, token_updates
+    except Exception as exc:  # noqa: BLE001
+        return make_visual_diff_status(
+            "error",
+            error=f"visual_diff_llm_failed: {exc!r}",
+            extra={"shape_id": shape_id, "node_count": len(visual_nodes)},
+        ), token_updates
+
+
 def validation_passed(state: OverallState) -> bool:
     return bool(state.get("passed", False))
 
@@ -477,22 +719,46 @@ def has_semantic_polish_candidates(state: OverallState) -> bool:
 def parse_tool_json_result(value: Any) -> dict[str, Any]:
     """Parse JSON-ish output returned by Penpot execute_code.
 
-    MCP responses often wrap the real JSON inside {"text": "..."} and that
-    inner JSON may wrap the plugin result again inside {"result": "..."}.
-    This function recursively unwraps those envelopes before building events.
+    Important: some MCP responses are wrappers like
+    {"type":"text", "text":"...", "id":"..."}. The old parser returned that
+    wrapper as if it were the plugin result, which produced null batch counts and
+    stopped the batched Stitch import after the first batch. This parser only
+    accepts dictionaries that look like a DVCP/Penpot result. Otherwise it returns
+    a clear diagnostic with a raw preview.
     """
+
+    def looks_like_result(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        result_keys = {
+            "all_applied",
+            "action",
+            "checked_count",
+            "applied_count",
+            "failed_count",
+            "created_shape_count",
+            "__dvcp_result_marker",
+            "__dvcp_import_op_marker",
+            "job_id",
+            "op_index",
+        }
+        return bool(result_keys.intersection(obj.keys()))
 
     def parse_text(text: str) -> Any:
         stripped = text.strip()
+        if not stripped:
+            return None
 
+        # Common successful shape: the script returns a JSON string.
         try:
             return json.loads(stripped)
         except json.JSONDecodeError:
             pass
 
+        # Some MCP wrappers prepend/append non-JSON text. Recover the largest
+        # object if possible.
         start = stripped.find("{")
         end = stripped.rfind("}")
-
         if start >= 0 and end > start:
             try:
                 return json.loads(stripped[start : end + 1])
@@ -502,7 +768,10 @@ def parse_tool_json_result(value: Any) -> dict[str, Any]:
         return None
 
     def unwrap(obj: Any, depth: int = 0) -> Any:
-        if depth > 8:
+        if depth > 10:
+            return None
+
+        if looks_like_result(obj):
             return obj
 
         if isinstance(obj, str):
@@ -512,43 +781,52 @@ def parse_tool_json_result(value: Any) -> dict[str, Any]:
             return unwrap(parsed, depth + 1)
 
         if isinstance(obj, list):
-            # MCP frequently returns a list like:
-            # [{"type": "text", "text": "{\"result\": \"{...}\"}"}].
-            # The useful JSON may be nested inside any item, so inspect all items.
             for item in obj:
                 parsed_item = unwrap(item, depth + 1)
-                if isinstance(parsed_item, dict):
+                if looks_like_result(parsed_item):
                     return parsed_item
             return None
 
         if isinstance(obj, dict):
             # Prefer known MCP/text envelopes over returning the wrapper itself.
-            for key in ("result", "text", "content"):
+            for key in ("result", "text", "content", "structuredContent"):
                 inner = obj.get(key)
                 if isinstance(inner, (str, dict, list)):
                     parsed_inner = unwrap(inner, depth + 1)
-                    if isinstance(parsed_inner, dict):
+                    if looks_like_result(parsed_inner):
                         return parsed_inner
 
-            return obj
+            # If this is a wrapper like {type,text,id}, do not accept it as a
+            # result. Return None so the caller gets a useful raw preview.
+            if set(obj.keys()).issubset({"type", "text", "id", "name", "mimeType"}):
+                return None
+
+            # As a last resort, accept a dict only when it has explicit error
+            # information and not merely MCP wrapper fields.
+            if obj.get("error") and not {"type", "text"}.issubset(obj.keys()):
+                return obj
 
         return None
 
     parsed = unwrap(value)
-
-    if isinstance(parsed, dict):
+    if looks_like_result(parsed) or (isinstance(parsed, dict) and parsed.get("error")):
         return parsed
 
     text = stringify_tool_result(value).strip()
     parsed = unwrap(text)
-
-    if isinstance(parsed, dict):
+    if looks_like_result(parsed) or (isinstance(parsed, dict) and parsed.get("error")):
         return parsed
 
     return {
         "all_applied": False,
+        "action": "import_external_design_spec",
         "error": "could_not_parse_tool_result",
-        "raw": text[:2000],
+        "checked_count": 0,
+        "applied_count": 0,
+        "failed_count": 1,
+        "created_shape_count": 0,
+        "raw_type": type(value).__name__,
+        "raw_preview": text[:2000],
     }
 
 
@@ -559,6 +837,151 @@ def build_apply_rename_script(rename_plan: list[dict[str, Any]]) -> str:
         "__RENAME_PLAN_JSON__",
         plan_json,
     )
+
+
+def build_import_external_design_script(spec: dict[str, Any]) -> str:
+    """Render the legacy Penpot Plugin API script that imports an ExternalDesignSpec."""
+    spec_json = json.dumps(spec, ensure_ascii=False, default=str)
+    return load_js("penpot_import_external_design_spec.js").replace(
+        "__EXTERNAL_DESIGN_SPEC_JSON__",
+        spec_json,
+    )
+
+
+def build_apply_import_op_script(op: dict[str, Any]) -> str:
+    """Render one tiny queue operation for Penpot execute_code.
+
+    execute_code interprets code as a function body, so the JS template must
+    return directly and must not wrap the result in an IIFE.
+    """
+    op_json = json.dumps(op, ensure_ascii=False, default=str)
+    return load_js("penpot_apply_import_op.js").replace(
+        "__IMPORT_OP_JSON__",
+        op_json,
+    )
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        return default
+    return max(value, 1)
+
+
+def _compact_stitch_metadata_for_penpot(metadata: Any) -> dict[str, Any]:
+    """Keep import metadata small for Penpot execute_code.
+
+    This does not drop design content. It only removes debug payloads such as
+    html_preview/extracted_elements_preview from the script sent to Penpot, which
+    can trigger MCP timeouts.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    keys = {
+        "stitch_mode",
+        "stitch_project_id",
+        "stitch_project_name",
+        "stitch_screen_id",
+        "stitch_screen_name",
+        "stitch_screen_resource",
+        "selection_hint",
+        "device_type",
+        "html_file",
+        "html_download_url_present",
+        "screenshot_file",
+        "screenshot_download_url_present",
+        "html_bytes_read",
+        "html_content_type",
+        "extracted_element_count",
+    }
+    return {key: metadata.get(key) for key in keys if key in metadata}
+
+
+def _spec_for_penpot_batch(spec: dict[str, Any], children: list[dict[str, Any]], index: int, total: int, start: int, end: int) -> dict[str, Any]:
+    chunk = dict(spec)
+    chunk["children"] = children
+    chunk["metadata"] = _compact_stitch_metadata_for_penpot(spec.get("metadata"))
+    chunk["_dvcp_batch"] = {
+        "index": index,
+        "total": total,
+        "start": start,
+        "end": end,
+        "child_count": len(spec.get("children") or []),
+        "create_root": index == 0,
+    }
+    return chunk
+
+
+def split_external_design_spec_for_penpot(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split one ExternalDesignSpec into Penpot-safe execute_code batches.
+
+    This is not a design limit. Every child is imported; the only difference is
+    that we avoid a single long-running MCP call by applying chunks sequentially.
+    """
+    children_raw = spec.get("children") or []
+    children = [child for child in children_raw if isinstance(child, dict)]
+    batch_size = _safe_int_env("STITCH_IMPORT_BATCH_SIZE", 8)
+
+    if not children:
+        return [_spec_for_penpot_batch(spec, [], 0, 1, 0, 0)]
+
+    total = (len(children) + batch_size - 1) // batch_size
+    chunks: list[dict[str, Any]] = []
+    for index in range(total):
+        start = index * batch_size
+        end = min(start + batch_size, len(children))
+        chunks.append(_spec_for_penpot_batch(spec, children[start:end], index, total, start, end))
+    return chunks
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def aggregate_penpot_batch_results(batch_results: list[dict[str, Any]]) -> dict[str, Any]:
+    checked = sum(_as_int(item.get("checked_count")) for item in batch_results)
+    applied = sum(_as_int(item.get("applied_count")) for item in batch_results)
+    failed = sum(_as_int(item.get("failed_count")) for item in batch_results)
+    created_shapes = sum(_as_int(item.get("created_shape_count")) for item in batch_results)
+    all_applied = bool(batch_results) and all(bool(item.get("all_applied")) for item in batch_results)
+    first_error = next((item.get("error") for item in batch_results if item.get("error")), None)
+
+    return {
+        "all_applied": all_applied,
+        "action": "import_external_design_spec",
+        "import_strategy": "batched_execute_code",
+        "batch_count": len(batch_results),
+        "checked_count": checked,
+        "applied_count": applied,
+        "failed_count": failed,
+        "created_shape_count": created_shapes,
+        "batches": [
+            {
+                "batch_index": item.get("batch_index"),
+                "batch_total": item.get("batch_total"),
+                "batch_start": item.get("batch_start"),
+                "batch_end": item.get("batch_end"),
+                "all_applied": item.get("all_applied"),
+                "checked_count": item.get("checked_count"),
+                "applied_count": item.get("applied_count"),
+                "failed_count": item.get("failed_count"),
+                "created_shape_count": item.get("created_shape_count"),
+                "error": item.get("error"),
+                "raw_type": item.get("raw_type"),
+                "raw_preview": item.get("raw_preview"),
+                "message": item.get("message"),
+            }
+            for item in batch_results
+        ],
+        "error": None if all_applied else (first_error or "one_or_more_batches_failed"),
+    }
 
 
 def build_verify_rename_script(expected_plan: list[dict[str, Any]]) -> str:
@@ -1011,31 +1434,162 @@ def _bbox_union(items: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _slug_words(value: Any, *, max_words: int = 3) -> str:
+    raw = str(value or "").strip()
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in raw)
+    words = [w for w in cleaned.split() if w]
+    if not words:
+        return "Generic"
+    return "".join(w[:1].upper() + w[1:] for w in words[:max_words])
+
+
+def _semantic_kind(item: dict[str, Any]) -> str:
+    return " ".join([
+        _role(item),
+        _region(item),
+        _target_name(item).lower(),
+        str(item.get("path") or "").lower(),
+        str(item.get("text") or "").lower(),
+    ])
+
+
+def _classify_ui_role(item: dict[str, Any]) -> str:
+    text = _semantic_kind(item)
+    if any(t in text for t in ["button", "btn", "cta", "submit", "primary", "secondary"]):
+        return "button"
+    if any(t in text for t in ["input", "field", "textbox", "search", "email", "password", "form", "select"]):
+        if _is_text(item) and any(t in text for t in ["label", "placeholder"]):
+            return "label"
+        return "input"
+    if any(t in text for t in ["checkbox", "toggle", "switch", "radio"]):
+        return "control"
+    if any(t in text for t in ["table", "row", "column", "cell", "grid"]):
+        return "table"
+    if any(t in text for t in ["chart", "graph", "metric", "kpi", "stat"]):
+        return "data_viz"
+    if any(t in text for t in ["card", "tile", "panel"]):
+        return "card"
+    if any(t in text for t in ["nav", "sidebar", "menu", "tab", "breadcrumb"]):
+        return "navigation"
+    if any(t in text for t in ["header", "topbar", "toolbar", "footer"]):
+        return "layout"
+    if any(t in text for t in ["image", "avatar", "photo", "thumbnail", "icon", "logo"]):
+        return "media"
+    if _is_text(item) and any(t in text for t in ["heading", "title", "headline", "h1", "h2"]):
+        return "heading"
+    if _is_text(item):
+        return "text"
+    if any(t in text for t in ["container", "frame", "board", "background", "surface"]):
+        return "surface"
+    return "component"
+
+
+def _component_family_for_role(role: str) -> str:
+    return {
+        "button": "Button",
+        "input": "Input",
+        "control": "Control",
+        "table": "Table",
+        "data_viz": "DataViz",
+        "card": "Card",
+        "navigation": "Navigation",
+        "layout": "Layout",
+        "media": "Media",
+        "surface": "Surface",
+        "heading": "Typography",
+        "text": "Typography",
+        "component": "Component",
+    }.get(role, "Component")
+
+
+def _component_variant_from_target(item: dict[str, Any], role: str, index: int) -> str:
+    text = _semantic_kind(item)
+    # Stable variants by common UI semantics, without assuming a screen template.
+    if role == "button":
+        if any(t in text for t in ["primary", "submit", "login", "save", "confirm", "cta"]):
+            return "Primary"
+        if "secondary" in text:
+            return "Secondary"
+        if any(t in text for t in ["danger", "delete", "remove"]):
+            return "Danger"
+    if role == "input":
+        for token, label in [
+            ("email", "Email"), ("password", "Password"), ("search", "Search"),
+            ("name", "Name"), ("phone", "Phone"), ("date", "Date"),
+            ("select", "Select"), ("filter", "Filter"),
+        ]:
+            if token in text:
+                return label
+    if role == "card":
+        for token, label in [("product", "Product"), ("metric", "Metric"), ("profile", "Profile"), ("login", "Login"), ("summary", "Summary")]:
+            if token in text:
+                return label
+    if role == "navigation":
+        for token, label in [("sidebar", "Sidebar"), ("tab", "Tabs"), ("menu", "Menu"), ("breadcrumb", "Breadcrumb")]:
+            if token in text:
+                return label
+    if role == "table":
+        for token, label in [("row", "Row"), ("cell", "Cell"), ("header", "Header"), ("main", "Main")]:
+            if token in text:
+                return label
+    name_source = _region(item) or _target_name(item) or role
+    variant = _slug_words(name_source, max_words=3)
+    if variant.lower() in {"component", "rectangle", "group", "text", "background", "container", "frame", "board"}:
+        variant = f"{_component_family_for_role(role)}{index}"
+    return variant
+
+
+def _component_name_for_target(item: dict[str, Any], index: int) -> str:
+    role = _classify_ui_role(item)
+    family = _component_family_for_role(role)
+    variant = _component_variant_from_target(item, role, index)
+    return f"{family}/{variant}"
+
+
+def _nearby_text_children(target: dict[str, Any], targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Find nearby text layers that likely belong to a non-text component."""
+    if _is_text(target):
+        return []
+    box = _bbox(target)
+    tx = box["x"]; ty = box["y"]; tw = box["width"]; th = box["height"]
+    out: list[dict[str, Any]] = []
+    for candidate in targets:
+        if candidate is target or not _is_text(candidate):
+            continue
+        cb = _bbox(candidate)
+        cx = cb["x"]; cy = cb["y"]; cw = cb["width"]; ch = cb["height"]
+        x_overlap = max(0, min(tx + tw, cx + cw) - max(tx, cx))
+        vertically_inside = (cy >= ty - 12 and cy + ch <= ty + th + 12)
+        close_above = 0 <= (ty - (cy + ch)) <= 20 and x_overlap > 0
+        close_below = 0 <= (cy - (ty + th)) <= 20 and x_overlap > 0
+        horizontally_related = x_overlap >= min(tw, max(cw, 1)) * 0.25
+        if horizontally_related and (vertically_inside or close_above or close_below):
+            out.append(candidate)
+    return out[:4]
+
+
 def build_deterministic_semantic_fix_plan(
     validation_report: Any,
     known_targets: list[dict[str, Any]],
     *,
     force: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build native Penpot semantic/tokenization fixes.
+    """Build pattern-agnostic native Penpot semantic/tokenization fixes.
 
-    Preferred representation:
-    - native Penpot token set in Assets/Tokens;
-    - native Penpot components/assets created from known target layers;
-    - token bindings applied to existing layers.
+    DVCP core must not assume a login screen. This planner derives tokens,
+    components and interactive-state metadata from detected roles in the visual
+    map: buttons, inputs, cards, navigation, tables, charts, media, text and
+    generic surfaces. Login, dashboard, ecommerce, settings, modal, table/list,
+    and unknown screens all pass through the same role-based planner.
 
-    Visible DVCP annotation panels are now an explicit fallback/debug option,
-    because they contaminate the main canvas. Enable them with:
-
+    Visible DVCP annotation panels remain fallback/debug only:
         PENPOT_SEMANTIC_FALLBACK_ANNOTATIONS=1
     """
     if not force and not semantic_auto_fix_enabled():
         return []
-
     if not isinstance(validation_report, dict) or not known_targets:
         return []
-
-    if not _semantic_issue_present(validation_report):
+    if not force and not _semantic_issue_present(validation_report):
         return []
 
     targets = [item for item in known_targets if isinstance(item, dict) and item.get("id")]
@@ -1043,52 +1597,51 @@ def build_deterministic_semantic_fix_plan(
         return []
 
     fallback_annotations = semantic_fallback_annotations_enabled()
-
-    def kind(item: dict[str, Any]) -> str:
-        return " ".join([
-            _role(item),
-            _region(item),
-            _target_name(item).lower(),
-        ])
-
-    card = next((t for t in targets if "card" in kind(t) or "container" in kind(t)), None)
-    title = next((t for t in targets if "title" in kind(t) or "heading" in kind(t)), None)
-    email_bg = next((t for t in targets if "email" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
-    email_label = next((t for t in targets if "email" in kind(t) and _is_text(t)), None)
-    password_bg = next((t for t in targets if "password" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
-    password_label = next((t for t in targets if "password" in kind(t) and _is_text(t)), None)
-    button_bg = next((t for t in targets if "button" in kind(t) and "background" in kind(t) and not _is_text(t)), None)
-    button_text = next((t for t in targets if "button" in kind(t) and _is_text(t)), None)
-
     plan: list[dict[str, Any]] = []
 
     token_specs = [
-        # Avoid parent/child token name collisions in Penpot by using full leaf names.
+        # Universal action/interaction tokens
         {"name": "color.action.primary.default", "type": "color", "value": "#2563EB"},
         {"name": "color.action.primary.hover", "type": "color", "value": "#1D4ED8"},
         {"name": "color.action.primary.disabled", "type": "color", "value": "#CBD5E1"},
         {"name": "color.focus.ring", "type": "color", "value": "#38BDF8"},
+        # Universal text/surface/border tokens
         {"name": "color.text.default", "type": "color", "value": "#111827"},
+        {"name": "color.text.muted", "type": "color", "value": "#64748B"},
         {"name": "color.text.inverse", "type": "color", "value": "#FFFFFF"},
         {"name": "color.text.disabled", "type": "color", "value": "#64748B"},
+        {"name": "color.border.default", "type": "color", "value": "#CBD5E1"},
         {"name": "color.border.input", "type": "color", "value": "#94A3B8"},
+        {"name": "color.surface.canvas", "type": "color", "value": "#FFFFFF"},
+        {"name": "color.surface.card", "type": "color", "value": "#F8FAFC"},
         {"name": "color.surface.input", "type": "color", "value": "#FFFFFF"},
+        # Universal spacing scale
+        {"name": "spacing.4", "type": "spacing", "value": "4px"},
+        {"name": "spacing.8", "type": "spacing", "value": "8px"},
         {"name": "spacing.12", "type": "spacing", "value": "12px"},
         {"name": "spacing.16", "type": "spacing", "value": "16px"},
         {"name": "spacing.24", "type": "spacing", "value": "24px"},
         {"name": "spacing.32", "type": "spacing", "value": "32px"},
         {"name": "spacing.form.gap", "type": "spacing", "value": "24px"},
         {"name": "spacing.input.padding.x", "type": "spacing", "value": "12px"},
+        # Universal typography scale
         {"name": "typography.heading.size", "type": "fontSizes", "value": "24px"},
+        {"name": "typography.body.size", "type": "fontSizes", "value": "16px"},
         {"name": "typography.label.size", "type": "fontSizes", "value": "14px"},
         {"name": "typography.button.size", "type": "fontSizes", "value": "16px"},
+        {"name": "typography.caption.size", "type": "fontSizes", "value": "12px"},
         {"name": "typography.heading.weight", "type": "fontWeights", "value": "600"},
+        {"name": "typography.body.weight", "type": "fontWeights", "value": "400"},
         {"name": "typography.label.weight", "type": "fontWeights", "value": "400"},
         {"name": "typography.button.weight", "type": "fontWeights", "value": "500"},
+        # Radius/border
+        {"name": "border.default.width", "type": "borderWidth", "value": "1px"},
         {"name": "border.input.width", "type": "borderWidth", "value": "1px"},
         {"name": "border.focus.width", "type": "borderWidth", "value": "2px"},
+        {"name": "radius.sm", "type": "borderRadius", "value": "4px"},
         {"name": "radius.input", "type": "borderRadius", "value": "6px"},
         {"name": "radius.button", "type": "borderRadius", "value": "6px"},
+        {"name": "radius.card", "type": "borderRadius", "value": "12px"},
     ]
 
     plan.append({
@@ -1096,7 +1649,7 @@ def build_deterministic_semantic_fix_plan(
         "set_name": "DVCP/Core",
         "tokens": token_specs,
         "fallback_annotations": fallback_annotations,
-        "reason": "Create native Penpot tokens for colors, spacing, typography and borders.",
+        "reason": "Create pattern-agnostic native Penpot tokens for UI structure, interaction and handoff.",
         "safety": "safe_native_token_library_write",
     })
 
@@ -1114,21 +1667,39 @@ def build_deterministic_semantic_fix_plan(
             "reason": reason,
         })
 
-    add_token_assignment(title, "typography.heading.size", ["fontSize"], "Bind title typography size token.")
-    add_token_assignment(title, "color.text.default", ["fill"], "Bind title text color token.")
-    add_token_assignment(email_label, "typography.label.size", ["fontSize"], "Bind email label typography token.")
-    add_token_assignment(email_label, "color.text.default", ["fill"], "Bind email label color token.")
-    add_token_assignment(password_label, "typography.label.size", ["fontSize"], "Bind password label typography token.")
-    add_token_assignment(password_label, "color.text.default", ["fill"], "Bind password label color token.")
-    add_token_assignment(button_text, "typography.button.size", ["fontSize"], "Bind button text typography token.")
-    add_token_assignment(button_text, "color.text.inverse", ["fill"], "Bind button text inverse color token.")
-    for input_bg in [email_bg, password_bg]:
-        add_token_assignment(input_bg, "color.surface.input", ["fill"], "Bind input surface token.")
-        add_token_assignment(input_bg, "color.border.input", ["stroke"], "Bind input border token.")
-        add_token_assignment(input_bg, "border.input.width", ["strokeWidth"], "Bind input border width token.")
-        add_token_assignment(input_bg, "radius.input", ["borderRadius"], "Bind input radius token.")
-    add_token_assignment(button_bg, "color.action.primary.default", ["fill"], "Bind primary button fill token.")
-    add_token_assignment(button_bg, "color.focus.ring", ["stroke"], "Bind primary button focus stroke token.")
+    for target in targets:
+        role = _classify_ui_role(target)
+        text = _semantic_kind(target)
+        if _is_text(target):
+            if role == "heading":
+                add_token_assignment(target, "typography.heading.size", ["fontSize"], "Bind heading typography token.")
+                add_token_assignment(target, "color.text.default", ["fill"], "Bind heading color token.")
+            elif role == "label" or "label" in text:
+                add_token_assignment(target, "typography.label.size", ["fontSize"], "Bind label typography token.")
+                add_token_assignment(target, "color.text.default", ["fill"], "Bind label color token.")
+            elif role == "button" or "button" in text:
+                add_token_assignment(target, "typography.button.size", ["fontSize"], "Bind button text typography token.")
+                add_token_assignment(target, "color.text.inverse", ["fill"], "Bind inverse text token for action text.")
+            else:
+                add_token_assignment(target, "typography.body.size", ["fontSize"], "Bind body text typography token.")
+                add_token_assignment(target, "color.text.default", ["fill"], "Bind body text color token.")
+            continue
+
+        if role == "button":
+            add_token_assignment(target, "color.action.primary.default", ["fill"], "Bind action fill token.")
+            add_token_assignment(target, "radius.button", ["borderRadius"], "Bind button radius token.")
+            add_token_assignment(target, "color.focus.ring", ["stroke"], "Bind focus ring token.")
+        elif role == "input" or role == "control":
+            add_token_assignment(target, "color.surface.input", ["fill"], "Bind input/control surface token.")
+            add_token_assignment(target, "color.border.input", ["stroke"], "Bind input/control border token.")
+            add_token_assignment(target, "border.input.width", ["strokeWidth"], "Bind input/control border width token.")
+            add_token_assignment(target, "radius.input", ["borderRadius"], "Bind input/control radius token.")
+        elif role in {"card", "surface", "layout"}:
+            add_token_assignment(target, "color.surface.card", ["fill"], "Bind surface/card token.")
+            add_token_assignment(target, "radius.card", ["borderRadius"], "Bind card/surface radius token.")
+            add_token_assignment(target, "color.border.default", ["stroke"], "Bind default border token.")
+        elif role in {"table", "navigation", "data_viz", "media", "component"}:
+            add_token_assignment(target, "color.border.default", ["stroke"], "Bind default structural border token.")
 
     if assignments:
         plan.append({
@@ -1136,13 +1707,22 @@ def build_deterministic_semantic_fix_plan(
             "set_name": "DVCP/Core",
             "assignments": assignments,
             "fallback_annotations": fallback_annotations,
-            "reason": "Bind native tokens to existing known target layers.",
+            "reason": "Bind native tokens to detected UI role targets.",
             "safety": "safe_native_token_bindings_known_targets",
         })
 
     def native_component(name: str, role: str, children: list[dict[str, Any]], reason: str) -> None:
-        clean_children = [c for c in children if isinstance(c, dict) and c.get("id")]
-        if len(clean_children) < 2:
+        clean_children = []
+        seen: set[str] = set()
+        for c in children:
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            cid = str(c.get("id"))
+            if cid in seen:
+                continue
+            seen.add(cid)
+            clean_children.append(c)
+        if not clean_children:
             return
         plan.append({
             "action": "create_native_component",
@@ -1155,113 +1735,90 @@ def build_deterministic_semantic_fix_plan(
             "safety": "safe_native_component_from_known_targets",
         })
 
-    native_component(
-        "TextInput/Email",
-        "text_input_component",
-        [email_bg, email_label],
-        "Create native Penpot asset/component for email input.",
-    )
-    native_component(
-        "TextInput/Password",
-        "text_input_component",
-        [password_bg, password_label],
-        "Create native Penpot asset/component for password input.",
-    )
-    native_component(
-        "Button/Primary",
-        "button_component",
-        [button_bg, button_text],
-        "Create native Penpot asset/component for primary login button.",
-    )
+    component_items: list[tuple[str, str, list[dict[str, Any]]]] = []
+    used_names: set[str] = set()
+    for idx, target in enumerate(targets, start=1):
+        role = _classify_ui_role(target)
+        if role in {"label", "text", "heading"} and _is_text(target):
+            continue
+        if role not in {"button", "input", "control", "card", "surface", "layout", "navigation", "table", "data_viz", "media", "component"}:
+            continue
+        name = _component_name_for_target(target, idx)
+        base_name = name
+        counter = 2
+        while name in used_names:
+            name = f"{base_name}{counter}"
+            counter += 1
+        used_names.add(name)
+        children = [target] + _nearby_text_children(target, targets)
+        semantic_role = f"{role}_component"
+        component_items.append((name, semantic_role, children))
+        native_component(name, semantic_role, children, f"Create native component asset for detected {role} role.")
 
-    # Native interactive state assets. These are lightweight component entries that
-    # document the intended focus/hover/disabled states in Penpot Assets without
-    # adding visible debug panels to the main canvas.
-    native_component(
-        "TextInput/Email/Focus",
-        "text_input_focus_state",
-        [email_bg, email_label],
-        "Create native focus-state asset for email input.",
-    )
-    native_component(
-        "TextInput/Password/Focus",
-        "text_input_focus_state",
-        [password_bg, password_label],
-        "Create native focus-state asset for password input.",
-    )
-    native_component(
-        "Button/Primary/Hover",
-        "button_hover_state",
-        [button_bg, button_text],
-        "Create native hover-state asset for primary button.",
-    )
-    native_component(
-        "Button/Primary/Disabled",
-        "button_disabled_state",
-        [button_bg, button_text],
-        "Create native disabled-state asset for primary button.",
-    )
-    native_component(
-        "Button/Primary/Focus",
-        "button_focus_state",
-        [button_bg, button_text],
-        "Create native focus-state asset for primary button.",
-    )
+    # If the full selection/root is a meaningful container, create a screen-level pattern asset.
+    container_targets = [t for t in targets if _classify_ui_role(t) in {"card", "surface", "layout"}]
+    if len(targets) >= 4:
+        screen_hint = str((validation_report.get("design_context_summary") or {}).get("root_shape_id") or "Screen")
+        screen_name = f"Screen/{_slug_words(screen_hint if screen_hint != 'selection' else 'Main', max_words=2)}"
+        screen_children = container_targets[:2] + [t for t in targets if _classify_ui_role(t) in {"heading", "button", "input", "card", "navigation", "table", "data_viz"}][:10]
+        if screen_children:
+            native_component(screen_name, "screen_pattern_component", screen_children, "Create native screen-level pattern asset from detected UI roles.")
 
-    if card and title and button_bg:
-        children = [item for item in [card, title, email_bg, email_label, password_bg, password_label, button_bg, button_text] if item]
-        native_component(
-            "Login/Card",
-            "login_card_component",
-            children,
-            "Create native Penpot asset/component for the full login card pattern.",
-        )
-
-    # Store interaction semantics as native token metadata/spec where possible.
-    # Visible state examples are now a fallback/debug concern, not the primary path.
-    for component_name, states in [
-        (
-            "TextInput/Email",
-            [
-                {"name": "default", "fill_token": "color.surface.input", "stroke_token": "color.border.input"},
-                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
-            ],
-        ),
-        (
-            "TextInput/Password",
-            [
-                {"name": "default", "fill_token": "color.surface.input", "stroke_token": "color.border.input"},
-                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
-            ],
-        ),
-        (
-            "Button/Primary",
-            [
+    def state_metadata_for(role: str) -> list[dict[str, Any]]:
+        if role == "button":
+            return [
                 {"name": "default", "fill_token": "color.action.primary.default", "text_token": "color.text.inverse"},
                 {"name": "hover", "fill_token": "color.action.primary.hover", "text_token": "color.text.inverse"},
                 {"name": "disabled", "fill_token": "color.action.primary.disabled", "text_token": "color.text.disabled"},
                 {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
-            ],
-        ),
-    ]:
+            ]
+        if role in {"input", "control"}:
+            return [
+                {"name": "default", "fill_token": "color.surface.input", "stroke_token": "color.border.input"},
+                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
+                {"name": "disabled", "fill_token": "color.action.primary.disabled", "text_token": "color.text.disabled"},
+            ]
+        if role in {"navigation", "table", "card"}:
+            return [
+                {"name": "default", "surface_token": "color.surface.card", "border_token": "color.border.default"},
+                {"name": "focus", "stroke_token": "color.focus.ring", "stroke_width_token": "border.focus.width"},
+            ]
+        return []
+
+    for name, semantic_role, children in component_items:
+        role = semantic_role.replace("_component", "")
+        states = state_metadata_for(role)
+        if not states:
+            continue
         plan.append({
             "action": "ensure_native_component_state_metadata",
-            "component_name": component_name,
+            "component_name": name,
+            "semantic_role": semantic_role,
             "states": states,
             "fallback_annotations": fallback_annotations,
             "reason": "Document interaction states as native component metadata when supported.",
             "safety": "safe_native_component_metadata",
         })
+        for state in states:
+            state_name = str(state.get("name") or "")
+            if state_name and state_name != "default":
+                native_component(
+                    f"{name}/{_slug_words(state_name, max_words=1)}",
+                    f"{role}_{state_name}_state",
+                    children,
+                    f"Create native {state_name} state asset for {name}.",
+                )
 
     if fallback_annotations:
-        cb = _bbox(card) if card else _bbox_union(targets)
+        cb = _bbox_union(targets)
         panel_x = _canonical_number(cb["x"] + cb["width"] + 80)
         panel_y = _canonical_number(cb["y"])
+        component_names = [item[0] for item in component_items]
         plan.append({
             "action": "create_design_tokens_annotation",
             "name": "DesignTokensFallback",
             "semantic_role": "design_tokens_fallback",
-            "bbox": {"x": panel_x, "y": panel_y, "width": 300, "height": 220},
+            "bbox": {"x": panel_x, "y": panel_y, "width": 340, "height": 260},
             "tokens": {t["name"]: t["value"] for t in token_specs},
             "reason": "Fallback only: visible token documentation when native tokens are unavailable.",
             "safety": "safe_semantic_fix_create_helper_layer",
@@ -1270,8 +1827,8 @@ def build_deterministic_semantic_fix_plan(
             "action": "create_handoff_annotation",
             "name": "HandoffNotesFallback",
             "semantic_role": "frontend_handoff_notes_fallback",
-            "bbox": {"x": panel_x, "y": panel_y + 248, "width": 360, "height": 220},
-            "text": "HandoffNotes\nNative target: Penpot Assets + Tokens\nComponents: TextInput/Email, TextInput/Password, Button/Primary, Login/Card\nStates: default, hover, focus, disabled\nAccessibility: labels grouped with inputs; focus state documented.",
+            "bbox": {"x": panel_x, "y": panel_y + 288, "width": 400, "height": 220},
+            "text": "HandoffNotes\nNative target: Penpot Assets + Tokens\nPattern: role-based, screen-agnostic\nStates: default, hover, focus, disabled where applicable\nAccessibility: semantic grouping and focus metadata documented.",
             "reason": "Fallback only: visible handoff documentation when native assets/tokens are unavailable.",
             "safety": "safe_semantic_fix_create_helper_layer",
         })
@@ -1279,8 +1836,8 @@ def build_deterministic_semantic_fix_plan(
             "action": "create_component_index_annotation",
             "name": "ComponentIndexFallback",
             "semantic_role": "component_index_fallback",
-            "bbox": {"x": panel_x, "y": panel_y + 496, "width": 360, "height": 160},
-            "components": ["TextInput/Email", "TextInput/Password", "TextInput/Email/Focus", "TextInput/Password/Focus", "Button/Primary", "Button/Primary/Hover", "Button/Primary/Focus", "Button/Primary/Disabled", "Login/Card", "DVCP/Core"],
+            "bbox": {"x": panel_x, "y": panel_y + 536, "width": 400, "height": 180},
+            "components": component_names[:24] + ["DVCP/Core"],
             "reason": "Fallback only: visible index for validator/handoff.",
             "safety": "safe_semantic_fix_create_helper_layer",
         })
@@ -1353,6 +1910,13 @@ async def prepare_input(
         "last_semantic_fix_plan": [],
         "canvas_auto_fix_result": None,
         "semantic_auto_fix_result": None,
+        "stitch_import_result": None,
+        "imported_design_spec": None,
+        "stitch_import_queue": None,
+        "stitch_import_queue_result": None,
+        "stitch_llm_memory": None,
+        "stitch_llm_plan_summary": None,
+        "stitch_visual_diff_report": None,
         "post_fix_validation_mode": None,
         "auto_fix_verified": False,
         "auto_fix_event": None,
@@ -1360,7 +1924,7 @@ async def prepare_input(
     }
 
     # Si la acción empieza validando, no mandamos todavía un mensaje al builder.
-    if not action_starts_with_validation(action):
+    if not action_starts_with_validation(action) and not action_imports_from_stitch(action):
         updates["messages"] = [HumanMessage(content=user_input)]
 
     return updates
@@ -1522,6 +2086,360 @@ async def tool_node(
         )
 
     return {"messages": result}
+
+
+async def _run_stitch_import_queue_job(
+    job: dict[str, Any],
+    execute_code: Any,
+    *,
+    max_ops: int | None = None,
+) -> dict[str, Any]:
+    """Run a prepared import queue from its current cursor.
+
+    Each execute_code call receives one tiny operation. This makes the import
+    resumable and avoids sending full HTML/spec/debug metadata to Penpot.
+    """
+    ops = [op for op in (job.get("ops") or []) if isinstance(op, dict)]
+    cursor = int(job.get("cursor") or 0)
+    if cursor < 0:
+        cursor = 0
+    if cursor > len(ops):
+        cursor = len(ops)
+
+    job.setdefault("results", [])
+    job.setdefault("created_shape_ids", [])
+    job["status"] = "running"
+    job["started_at"] = job.get("started_at") or utc_now_iso()
+
+    run_count = 0
+    for index in range(cursor, len(ops)):
+        if max_ops is not None and run_count >= max_ops:
+            job["status"] = "paused"
+            break
+
+        op = dict(ops[index])
+        op["op_index"] = index
+        op["op_total"] = len(ops)
+        script = build_apply_import_op_script(op)
+
+        try:
+            raw_result = await execute_code.ainvoke({"code": script})
+            penpot_result = parse_tool_json_result(raw_result)
+        except Exception as exc:
+            penpot_result = {
+                "all_applied": False,
+                "action": "dvcp_apply_import_op",
+                "import_strategy": "queue_execute_code",
+                "job_id": job.get("job_id"),
+                "op_index": index,
+                "op_total": len(ops),
+                "op": op.get("op"),
+                "name": op.get("name"),
+                "checked_count": 1,
+                "applied_count": 0,
+                "failed_count": 1,
+                "created_shape_count": 0,
+                "created_shape_ids": [],
+                "error": repr(exc),
+            }
+
+        penpot_result.setdefault("job_id", job.get("job_id"))
+        penpot_result.setdefault("op_index", index)
+        penpot_result.setdefault("op_total", len(ops))
+        penpot_result.setdefault("op", op.get("op"))
+        penpot_result.setdefault("name", op.get("name"))
+        job["results"].append(penpot_result)
+
+        for shape_id in penpot_result.get("created_shape_ids", []) or []:
+            if shape_id and shape_id not in job["created_shape_ids"]:
+                job["created_shape_ids"].append(shape_id)
+
+        if not penpot_result.get("all_applied"):
+            job["status"] = "paused"
+            job["cursor"] = index
+            job["last_error"] = penpot_result.get("error") or "op_failed"
+            return job
+
+        job["cursor"] = index + 1
+        run_count += 1
+
+    if int(job.get("cursor") or 0) >= len(ops):
+        job["status"] = "completed"
+        job["finished_at"] = utc_now_iso()
+    else:
+        job["status"] = "paused"
+
+    return job
+
+
+async def import_from_stitch(
+    state: OverallState,
+    runtime: Runtime[Context],
+) -> Dict[str, Any]:
+    """Single public Stitch import action.
+
+    Internal strategy:
+    1. Fetch existing Stitch screen (read-only Stitch MCP).
+    2. Build rendered Playwright ExternalDesignSpec as deterministic baseline.
+    3. Prefer deterministic transform T : StitchRenderedElement -> Pow(PenpotLayer).
+    4. Optionally fall back to the previous LLM planner when explicitly enabled.
+    5. Execute via internal queue_execute_code.
+
+    Public action remains only: {"action": "import_from_stitch"}.
+    """
+    selection_hint = state.get("changeme") or ""
+    token_updates: dict[str, Any] = {}
+
+    spec: dict[str, Any] | None = None
+    base_spec: dict[str, Any] | None = None
+    stitch_payload: dict[str, Any] | None = None
+    stitch_memory: dict[str, Any] | None = None
+    llm_plan: dict[str, Any] | None = None
+    llm_plan_summary: dict[str, Any] = {"used": False, "reason": "not_started"}
+
+    project_id = state.get("stitch_project_id") or None
+    project_name = state.get("stitch_project_name") or None
+    screen_id = state.get("stitch_screen_id") or None
+    screen_name = state.get("stitch_screen_name") or None
+
+    try:
+        stitch_payload = await fetch_existing_stitch_screen(
+            project_id=project_id,
+            project_name=project_name,
+            screen_id=screen_id,
+            screen_name=screen_name,
+        )
+        base_spec = build_external_design_spec_from_stitch(stitch_payload, selection_hint)
+        stitch_memory = build_stitch_llm_memory(
+            stitch_payload,
+            base_spec,
+            selection_hint=selection_hint,
+        )
+
+        # v06.8 default: no LLM structural planner. Build the Penpot operation
+        # graph by deterministic transformation T : StitchRenderedElement -> Pow(PenpotLayer).
+        # The older LLM planner remains available by setting
+        # STITCH_IMPORT_DETERMINISTIC_TRANSFORM=0 and STITCH_IMPORT_LLM_PLANNER=1.
+        enable_deterministic_transform = os.getenv("STITCH_IMPORT_DETERMINISTIC_TRANSFORM", "1").strip().lower() in {"1", "true", "yes", "on"}
+        enable_llm_planner = os.getenv("STITCH_IMPORT_LLM_PLANNER", "0").strip().lower() in {"1", "true", "yes", "on"}
+        enable_llm_vision = os.getenv("STITCH_IMPORT_LLM_VISION", "1").strip().lower() in {"1", "true", "yes", "on"}
+        screenshot_available = bool(((stitch_memory or {}).get("reference_image") or {}).get("available"))
+        planner_mode = "not_started"
+        planner_error = None
+
+        if enable_deterministic_transform:
+            spec, llm_plan_summary = build_external_design_spec_from_deterministic_transform(base_spec)
+            planner_mode = "deterministic_transform_T"
+        elif enable_llm_planner:
+            try:
+                planner_mode = "vision" if enable_llm_vision and screenshot_available else "text"
+                messages = build_stitch_llm_planner_messages(
+                    stitch_memory,
+                    include_image=bool(enable_llm_vision and screenshot_available),
+                )
+                metered = await metered_ainvoke(
+                    llm,
+                    messages,
+                    estimated_completion_tokens=int(os.getenv("STITCH_IMPORT_LLM_COMPLETION_TOKENS", "3200")),
+                )
+                token_updates = merge_metered_usage_updates(state, token_updates, metered)
+                llm_plan = parse_llm_build_plan(content_to_text(metered.ai_message.content))
+                spec, llm_plan_summary = build_external_design_spec_from_llm_plan(llm_plan, base_spec)
+            except Exception as exc:  # noqa: BLE001
+                planner_error = repr(exc)
+                # Some model adapters/accounts may not support image inputs. Retry once
+                # text-only so the public action still works and token accounting stays
+                # inside metered_ainvoke.
+                if enable_llm_vision and os.getenv("STITCH_IMPORT_LLM_TEXT_RETRY", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                    try:
+                        planner_mode = "text_retry_after_vision_error"
+                        messages = build_stitch_llm_planner_messages(stitch_memory, include_image=False)
+                        metered = await metered_ainvoke(
+                            llm,
+                            messages,
+                            estimated_completion_tokens=int(os.getenv("STITCH_IMPORT_LLM_COMPLETION_TOKENS", "3200")),
+                        )
+                        token_updates = merge_metered_usage_updates(state, token_updates, metered)
+                        llm_plan = parse_llm_build_plan(content_to_text(metered.ai_message.content))
+                        spec, llm_plan_summary = build_external_design_spec_from_llm_plan(llm_plan, base_spec)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        spec, sanitize_summary = sanitize_external_design_spec_for_import(base_spec)
+                        llm_plan_summary = {
+                            "used": False,
+                            "reason": "llm_planner_failed_then_text_retry_failed",
+                            "planner_error": planner_error,
+                            "text_retry_error": repr(retry_exc),
+                            "fallback_sanitize": sanitize_summary,
+                        }
+                else:
+                    spec, sanitize_summary = sanitize_external_design_spec_for_import(base_spec)
+                    llm_plan_summary = {
+                        "used": False,
+                        "reason": "llm_planner_failed",
+                        "planner_error": planner_error,
+                        "fallback_sanitize": sanitize_summary,
+                    }
+        else:
+            spec, sanitize_summary = sanitize_external_design_spec_for_import(base_spec)
+            llm_plan_summary = {
+                "used": False,
+                "reason": "disabled_by_STITCH_IMPORT_LLM_PLANNER",
+                "fallback_sanitize": sanitize_summary,
+            }
+
+        llm_plan_summary = dict(llm_plan_summary or {})
+        llm_plan_summary.update(
+            {
+                "planner_mode": planner_mode,
+                "vision_requested": bool(enable_llm_vision),
+                "vision_used": bool(planner_mode == "vision"),
+                "screenshot_available": bool(screenshot_available),
+            }
+        )
+
+        job = build_stitch_import_queue(spec)
+    except Exception as exc:
+        result = {
+            "all_applied": False,
+            "stage": "stitch_llm_guided_prepare",
+            "error": repr(exc),
+            "checked_count": 0,
+            "applied_count": 0,
+            "failed_count": 1,
+            "strategy": {
+                "public_action": "import_from_stitch",
+                "planning": "deterministic_transform_with_optional_llm_fallback",
+                "layout": "playwright_rendered",
+                "execution": "queue_execute_code_v06_8_native_visual_materialization",
+            },
+            "hint": "Revisa STITCH_API_KEY, STITCH_PROJECT_ID/STITCH_SCREEN_ID y Playwright.",
+        }
+        return {
+            **token_updates,
+            "stitch_import_result": result,
+            "stitch_import_queue": None,
+            "stitch_import_queue_result": result,
+            "imported_design_spec": None,
+            "stitch_visual_diff_report": None,
+            "skip_validation": True,
+            "response": "No se pudo preparar import_from_stitch.",
+        }
+
+    await get_builder_tools()
+    execute_code = _builder_tools_by_name.get("execute_code")
+
+    if execute_code is None:
+        result = {
+            "all_applied": False,
+            "stage": "penpot_execute_code_lookup",
+            "error": "execute_code_not_available",
+            "checked_count": 1,
+            "applied_count": 0,
+            "failed_count": 1,
+        }
+        return {
+            **token_updates,
+            "stitch_import_result": result,
+            "stitch_import_queue": job,
+            "stitch_import_queue_result": result,
+            "imported_design_spec": compact_imported_design_spec_for_output(spec) if isinstance(spec, dict) else spec,
+            "stitch_llm_memory": compact_memory_for_output(stitch_memory or {}),
+            "stitch_llm_plan_summary": llm_plan_summary,
+            "stitch_visual_diff_report": None,
+            "skip_validation": True,
+            "response": "No se pudo importar porque execute_code no está disponible en Penpot MCP.",
+        }
+
+    # Internal queue execution. The user never needs a separate queue action.
+    max_ops_raw = os.getenv("STITCH_IMPORT_QUEUE_MAX_OPS_PER_RUN", "0").strip()
+    try:
+        max_ops = int(max_ops_raw)
+    except Exception:
+        max_ops = 0
+    max_ops_arg = max_ops if max_ops > 0 else None
+
+    job = await _run_stitch_import_queue_job(job, execute_code, max_ops=max_ops_arg)
+    queue_result = aggregate_stitch_import_queue_results(job)
+
+    # v06.8 intentionally skips LLM visual diff. The authoritative diagnostic
+    # is now the deterministic source-to-Penpot trace generated by the queue:
+    # each Penpot shape is mapped back to a rendered source element and its
+    # expected computed values.
+    visual_diff_report: dict[str, Any] | None = make_visual_diff_status(
+        "skipped", reason="replaced_by_source_to_penpot_trace_v06_8_native_visual_materialization"
+    )
+    source_trace_report = queue_result.get("source_trace_report")
+    source_to_penpot_map = queue_result.get("source_to_penpot_map")
+
+    stitch_info = {}
+    if isinstance(stitch_payload, dict):
+        stitch_info = {
+            "mode": stitch_payload.get("mode"),
+            "project_id": stitch_payload.get("project_id"),
+            "project_name": stitch_payload.get("project_name"),
+            "screen_id": stitch_payload.get("screen_id"),
+            "screen_name": stitch_payload.get("screen_name"),
+            "tools_detected": stitch_payload.get("tools_detected", []),
+            "api_key_redacted": stitch_payload.get("api_key_redacted"),
+        }
+
+    result = {
+        "type": "stitch_import_execution",
+        "imported_at": utc_now_iso(),
+        "screen_name": job.get("screen_name") or (spec or {}).get("screen_name") if isinstance(spec, dict) else None,
+        "screen_type": job.get("screen_type") or (spec or {}).get("screen_type") if isinstance(spec, dict) else None,
+        "source": "stitch",
+        "import_mode": (spec or {}).get("import_mode") if isinstance(spec, dict) else "existing_screen_html_llm_guided",
+        "strategy": {
+            "public_action": "import_from_stitch",
+            "planning": ("deterministic_transform" if llm_plan_summary.get("deterministic") else ("llm_vision_guided" if llm_plan_summary.get("vision_used") else ("llm_guided" if llm_plan_summary.get("used") else "rendered_fallback"))),
+            "layout": ((base_spec or {}).get("metadata") or {}).get("layout_extraction_mode", "rendered_playwright") if isinstance(base_spec, dict) else "unknown",
+            "assembly": "generic_semantic_component_assembly",
+            "execution": "queue_execute_code_v06_8_native_visual_materialization",
+                        "validation": "normal_validator_optional_env_STITCH_IMPORT_RUN_VALIDATOR",
+        },
+        "stitch": stitch_info,
+        "llm_plan_summary": llm_plan_summary,
+        "memory_summary": compact_memory_for_output(stitch_memory or {}),
+        "penpot_apply_result": queue_result,
+        "component_assembly_summary": queue_result.get("component_assembly_summary"),
+        "visual_materialization_summary": queue_result.get("visual_materialization_summary"),
+        "source_trace_report": source_trace_report,
+        "source_to_penpot_map": source_to_penpot_map,
+        "visual_diff_report": visual_diff_report,
+        "all_applied": bool(queue_result.get("all_applied")),
+        "status": queue_result.get("status"),
+        "cursor": queue_result.get("cursor"),
+        "total_ops": queue_result.get("total_ops"),
+        "checked_count": queue_result.get("checked_count"),
+        "applied_count": queue_result.get("applied_count"),
+        "failed_count": queue_result.get("failed_count"),
+        "created_shape_count": queue_result.get("created_shape_count"),
+        "created_shape_ids": queue_result.get("created_shape_ids", []),
+        "error": queue_result.get("error"),
+    }
+
+    all_applied = bool(result["all_applied"])
+    return {
+        **token_updates,
+        "stitch_import_result": result,
+        "stitch_import_queue": job,
+        "stitch_import_queue_result": queue_result,
+        "imported_design_spec": compact_imported_design_spec_for_output(spec) if isinstance(spec, dict) else spec,
+        "stitch_llm_memory": compact_memory_for_output(stitch_memory or {}),
+        "stitch_llm_plan_summary": llm_plan_summary,
+        "stitch_visual_diff_report": visual_diff_report,
+        "stitch_source_trace_report": source_trace_report,
+        "stitch_source_to_penpot_map": source_to_penpot_map,
+        "skip_validation": not all_applied,
+        "response": (
+            f"import_from_stitch completado: {job.get('screen_name')} "
+            f"({queue_result.get('total_ops')} operaciones, {queue_result.get('created_shape_count')} shapes). "
+            f"Plan: {result['strategy']['planning']}."
+            if all_applied else
+            f"import_from_stitch pausado/falló en cursor {queue_result.get('cursor')}/{queue_result.get('total_ops')}: {queue_result.get('error')}"
+        ),
+    }
 
 
 async def run_validator(
@@ -2241,8 +3159,11 @@ async def record_canvas_auto_fix_event(
 
 def route_after_prepare(
     state: OverallState,
-) -> Literal["llm_call", "run_validator"]:
+) -> Literal["llm_call", "run_validator", "import_from_stitch"]:
     action = normalize_action(state.get("action"))
+
+    if action_imports_from_stitch(action):
+        return "import_from_stitch"
 
     if action_starts_with_validation(action):
         return "run_validator"
@@ -2317,6 +3238,20 @@ def route_after_auto_fix_verification(
     return END
 
 
+def route_after_stitch_import(
+    state: OverallState,
+) -> Literal["run_validator", "__end__"]:
+    action = normalize_action(state.get("action"))
+
+    if state.get("skip_validation"):
+        return END
+
+    if action_requires_validation_after_import(action):
+        return "run_validator"
+
+    return END
+
+
 def route_after_validator(
     state: OverallState,
 ) -> Literal["fix_design", "__end__"]:
@@ -2359,6 +3294,7 @@ agent_builder = StateGraph(
 agent_builder.add_node("prepare_input", prepare_input)
 agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("tool_node", tool_node)
+agent_builder.add_node("import_from_stitch", import_from_stitch)
 agent_builder.add_node("run_validator", run_validator)
 agent_builder.add_node("fix_design", fix_design)
 agent_builder.add_node("apply_auto_fix_plan_deterministic", apply_auto_fix_plan_deterministic)
@@ -2372,7 +3308,13 @@ agent_builder.add_edge(START, "prepare_input")
 agent_builder.add_conditional_edges(
     "prepare_input",
     route_after_prepare,
-    ["llm_call", "run_validator"],
+    ["llm_call", "run_validator", "import_from_stitch"],
+)
+
+agent_builder.add_conditional_edges(
+    "import_from_stitch",
+    route_after_stitch_import,
+    ["run_validator", END],
 )
 
 agent_builder.add_conditional_edges(
