@@ -470,7 +470,7 @@ function createVisualMaterializedShape(op, offset) {
   var svg = visualSvgForOp(op);
   var info = {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.10",
+    version: "v06.12",
     method: "svg_fallback",
     visually_materialized: false,
     fallback_used: false,
@@ -634,9 +634,13 @@ function normalizeFontFamily(value) {
   var v = String(value || "").trim();
   if (!v) return "";
   var lower = v.toLowerCase();
-  if (lower.indexOf("material symbols") >= 0 || lower.indexOf("material icons") >= 0) return "";
+  // v06.12: Material Symbols are icon-font ligatures. Do not strip the
+  // family, otherwise Penpot renders words such as "person" or
+  // "arrow_forward" as normal text.
+  if (lower.indexOf("material symbols") >= 0) return "Material Symbols Outlined";
+  if (lower.indexOf("material icons") >= 0) return "Material Icons";
   if (lower.indexOf("system-ui") >= 0 || lower.indexOf("sans-serif") >= 0) return "";
-  // v06.10: try to preserve the source family. If Penpot cannot resolve it, the
+  // v06.12: try to preserve the source family. If Penpot cannot resolve it, the
   // readback/report will record the fallback explicitly instead of hiding it.
   return v;
 }
@@ -912,6 +916,20 @@ function createText(name, text, bbox, color, fontSize, offset, style) {
 }
 
 
+function isMaterialSymbolOp(op) {
+  op = op || {};
+  var fam = String(op.font_family || op.source_font_family || "").toLowerCase();
+  var cls = String(op.css_class || "").toLowerCase();
+  return !!op.is_material_symbol || fam.indexOf("material symbols") >= 0 || fam.indexOf("material icons") >= 0 || cls.indexOf("material-symbol") >= 0;
+}
+
+function materialSymbolTextFromOp(op) {
+  op = op || {};
+  var raw = String(op.material_symbol_name || op.text || "").trim();
+  if (raw) return raw;
+  return iconTextFromOp(Object.assign({}, op, { is_material_symbol: false, font_family: "" }));
+}
+
 function iconTextFromOp(op) {
   op = op || {};
   var raw = String(op.text || "").trim();
@@ -927,9 +945,9 @@ function iconTextFromOp(op) {
     else raw = "dot";
   }
   var r = String(raw).toLowerCase();
-  // Use Unicode/safe glyph fallbacks instead of relying on Material Symbols
-  // being installed in the Penpot runtime. The goal is visible editable UI,
-  // not pixel-perfect icon-font reproduction at this stage.
+  if (isMaterialSymbolOp(op)) return raw;
+  // When the source does not expose an icon-font glyph, use a Unicode fallback.
+  // Real rendered Material Symbols take the raw ligature path above.
   if (r === "arrow_forward" || r === "arrow" || r === "chevron_right") return "→";
   if (r.indexOf("shield") >= 0) return "◇";
   if (r.indexOf("lock") >= 0) return "▣";
@@ -980,16 +998,31 @@ function createIconShapes(op, offset) {
   if (!hasBackground) {
     glyphBox = b;
   }
+  var materialSymbol = isMaterialSymbolOp(op);
   var style = textStyleFromOp(Object.assign({}, op, {
     color: iconColor,
     font_size: fontSize,
     font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
-    font_family: "",
+    font_family: materialSymbol ? (op.font_family || op.source_font_family || "Material Symbols Outlined") : "",
+    source_font_family: materialSymbol ? (op.source_font_family || op.font_family || "Material Symbols Outlined") : (op.source_font_family || op.font_family || ""),
     text_align: "center",
-    line_height: fontSize + 2,
+    line_height: materialSymbol ? 1 : fontSize + 2,
+    source_line_height_px: materialSymbol ? fontSize : (op.source_line_height_px || fontSize + 2),
+    penpot_line_height_ratio: materialSymbol ? 1 : (op.penpot_line_height_ratio || null),
     opacity: op.opacity === undefined ? 1 : op.opacity
   }));
-  var glyph = createText(String(op.name || "Icon") + "_Glyph", iconTextFromOp(op), glyphBox, iconColor, fontSize, offset, style);
+  var glyphText = materialSymbol ? materialSymbolTextFromOp(op) : iconTextFromOp(op);
+  var glyph = createText(String(op.name || "Icon") + "_Glyph", glyphText, glyphBox, iconColor, fontSize, offset, style);
+  if (glyph && materialSymbol) {
+    setPluginDataSafe(glyph, "is_material_symbol", "true");
+    setPluginDataSafe(glyph, "material_symbol_name", glyphText);
+    // Re-apply the symbol font after text/weight/position writes; Penpot may
+    // reset the family when the glyph characters are assigned.
+    trySet(glyph, "fontFamily", normalizeFontFamily(style.font_family));
+    if (typeof glyph.setFontFamily === "function") {
+      try { glyph.setFontFamily(normalizeFontFamily(style.font_family)); } catch (errMs) {}
+    }
+  }
   if (glyph) created.push(glyph);
   return created;
 }
@@ -1002,7 +1035,7 @@ function nativeVisualInfo(op, method, created, error) {
   var expectedText = !!op.text;
   return {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.10",
+    version: "v06.12",
     method: method || "native_first",
     materialization_kind: "native_penpot_shapes",
     visually_materialized: created.length > 0,
@@ -1480,7 +1513,7 @@ function applyImportOp(op) {
   if (!result.visual_materialization && op.op !== "create_root" && op.op !== "finalize_import_job") {
     result.visual_materialization = {
       schema: "dvcp.visual_materialization.v1",
-      version: "v06.10",
+      version: "v06.12",
       method: "native_fallback_legacy_path",
       visually_materialized: created.length > 0,
       fallback_used: true,
@@ -1522,7 +1555,7 @@ function applyImportOp(op) {
     if (op.source_line_height_px !== undefined) setPluginDataSafe(shape, "source_line_height_px", String(op.source_line_height_px));
     if (op.penpot_line_height_ratio !== undefined) setPluginDataSafe(shape, "penpot_line_height_ratio", String(op.penpot_line_height_ratio));
     if (op.text) setPluginDataSafe(shape, "dvcp_text", String(op.text).slice(0, 300));
-    setPluginDataSafe(shape, "visual_materialization", "v06_10_dynamic_text_style_bridge");
+    setPluginDataSafe(shape, "visual_materialization", "v06_12_icon_source_precedence");
     if (result.visual_materialization) setPluginDataSafe(shape, "visual_materialization_detail", result.visual_materialization);
     result.created_shape_ids.push(getShapeId(shape));
     result.penpot_readback.push(compactShapeReadback(shape));

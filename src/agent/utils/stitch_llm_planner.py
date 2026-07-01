@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -67,6 +68,22 @@ def _num(v: Any, default: float = 0.0) -> float:
         return float(str(v).replace("px", "").strip())
     except Exception:
         return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rendered_import_icons_enabled() -> bool:
+    # This is the single switch for icon inference. When Stitch rendered icon
+    # extraction is enabled, rendered Material Symbol glyphs are the source of
+    # truth and no heuristic icon layers should be invented. When it is off,
+    # inference remains the fallback so older/non-icon extraction runs still
+    # produce usable affordances.
+    return _env_bool("STITCH_RENDERED_IMPORT_ICONS", False)
 
 
 def _bbox(v: Any) -> dict[str, float] | None:
@@ -327,9 +344,16 @@ def _copy_present(target: dict[str, Any], expected: dict[str, Any], keys: tuple[
 def _source_fidelity_kind(item: dict[str, Any]) -> str:
     kind = str(item.get("kind") or "").lower()
     role = str(item.get("role") or "").lower()
+    component_type = str(item.get("component_type") or "").lower()
+    dt = item.get("deterministic_transform") if isinstance(item.get("deterministic_transform"), dict) else {}
+    rule_id = str(dt.get("rule_id") or "").lower()
     snap = item.get("source_snapshot") if isinstance(item.get("source_snapshot"), dict) else {}
     skind = str(snap.get("kind") or "").lower()
     srole = str(snap.get("role") or "").lower()
+    # Icon containers are visual surfaces, not icon glyphs. They must preserve
+    # source.fill/radius (e.g. blue logo block) instead of projecting color as fill.
+    if component_type == "icon_container" or rule_id == "icon.container_surface":
+        return "surface"
     if kind in {"text", "heading"} or role in {"label", "placeholder", "heading", "body_text", "link", "content"}:
         if skind in {"button", "input", "textarea", "select", "control"} or srole in {"button_primary", "button_secondary", "input", "field", "control"}:
             return "text_slot"
@@ -353,7 +377,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
     v06.4 exposed that many remaining visual drifts were introduced before
     Penpot: strokes/radii/footer height/action colors had been normalized by
     the LLM or tokens even though the Playwright source carried exact computed
-    values. v06.10 applies a deterministic precedence rule:
+    values. v06.12 applies a deterministic precedence rule:
 
         rendered source style > LLM planned value > token fallback > default
 
@@ -403,11 +427,16 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
                 # Keep planned text when it is not a reliable substring.
                 pass
         elif fidelity_kind == "icon":
-            # v06.10: an icon slot represents a glyph, not its parent surface.
-            # CSS `fill` on the source often means input/button background; the
-            # glyph paint should come from computed text color. Keep the target
-            # bbox/text, project glyph color deterministically, and drop
-            # inherited container/font noise.
+            # v06.12: distinguish true Material Symbol glyphs from inferred icon
+            # slots. True glyphs must preserve the source font family and
+            # ligature text; inferred slots should not inherit parent typography.
+            is_material_symbol = bool(
+                item.get("is_material_symbol")
+                or _font_family_is_material_symbol(item.get("font_family"))
+                or _font_family_is_material_symbol(item.get("source_font_family"))
+                or _font_family_is_material_symbol(expected.get("font_family"))
+                or _font_family_is_material_symbol(expected.get("source_font_family"))
+            )
             icon_color = (
                 item.get("color")
                 or item.get("text_color")
@@ -419,10 +448,18 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
                 item["fill"] = icon_color
                 item["color"] = icon_color
             _copy_present(item, expected, ("opacity",), overwrite=True)
-            for inherited_key in (
-                "stroke", "stroke_width", "radius", "box_shadow", "input_type",
-                "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align",
-            ):
+            if is_material_symbol:
+                _copy_present(item, expected, ("font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align"), overwrite=True)
+                item["is_material_symbol"] = True
+                item["material_symbol_name"] = item.get("material_symbol_name") or item.get("text") or expected.get("text")
+                item.setdefault("penpot_line_height_ratio", 1)
+                inherited_to_drop = ("stroke", "stroke_width", "radius", "box_shadow", "input_type")
+            else:
+                inherited_to_drop = (
+                    "stroke", "stroke_width", "radius", "box_shadow", "input_type",
+                    "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align",
+                )
+            for inherited_key in inherited_to_drop:
                 item.pop(inherited_key, None)
         else:
             _copy_present(item, expected, ("bbox", "fill", "stroke", "stroke_width", "color", "text_color", "radius", "opacity"))
@@ -434,7 +471,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         item["source_fidelity"] = {
             "schema": "dvcp.source_fidelity.v1",
             "mode": "computed_source_authority",
-            "version": "v06.10",
+            "version": "v06.12",
             "applied": bool(changed),
             "fidelity_kind": fidelity_kind,
             "copied_fields": changed,
@@ -443,8 +480,8 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         out.append(item)
     return out, {
         "schema": "dvcp.source_fidelity_summary.v1",
-        "version": "v06.10",
-        "strategy": "computed_source_style_authority_icon_slot_fidelity",
+        "version": "v06.12",
+        "strategy": "computed_source_style_authority_icon_source_precedence",
         "target_count": len(children),
         "planned_source_count": planned_count,
         "mode_counts": mode_counts,
@@ -484,7 +521,7 @@ def _attach_source_traces(children: list[dict[str, Any]], sources: list[dict[str
         "target_count": len(out),
         "matched_count": matched,
         "unmatched_count": unmatched,
-        "strategy": "bbox_text_kind_role_nearest_source_match_v06_10_dynamic_text_style_bridge",
+        "strategy": "bbox_text_kind_role_nearest_source_match_v06_12_icon_source_precedence",
     }
 
 
@@ -586,7 +623,7 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
 
 
 # -----------------------------------------------------------------------------
-# v06.10 deterministic Stitch -> Penpot transform
+# v06.12 deterministic Stitch -> Penpot transform
 # -----------------------------------------------------------------------------
 # Formal intent:
 #   S = set of rendered Stitch source elements
@@ -664,7 +701,7 @@ def _target_from_source(
         "slot": slot,
         "deterministic_transform": {
             "schema": "dvcp.deterministic_transform.v1",
-            "version": "v06.10",
+            "version": "v06.12",
             "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
             "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
             "source_domain": "StitchRenderedElement",
@@ -774,13 +811,113 @@ def _icon_bbox_inside(source: dict[str, Any], *, side: str = "leading", size: fl
         "height": size,
     }
 
+def _font_family_is_material_symbol(value: Any) -> bool:
+    raw = str(value or "").lower()
+    return "material symbols" in raw or "material icons" in raw
 
-def _transform_one_source_to_penpot(source: dict[str, Any], index: int) -> list[dict[str, Any]]:
+
+def _is_material_symbol_glyph_source(source: dict[str, Any]) -> bool:
+    """True for the actual icon-font glyph node, not its layout wrapper."""
+    kind = str(source.get("kind") or "").lower()
+    role = str(source.get("role") or "").lower()
+    tag = str(source.get("tag") or "").lower()
+    text = str(source.get("text") or "").strip().lower()
+    family = source.get("font_family") or source.get("source_font_family")
+    css = str(source.get("css_class") or "").lower()
+    return (
+        (kind == "icon" or role == "icon" or "material-symbol" in css)
+        and tag in {"span", "i", "em"}
+        and bool(text)
+        and (_font_family_is_material_symbol(family) or "material-symbol" in css)
+    )
+
+
+def _source_has_visible_paint(source: dict[str, Any]) -> bool:
+    fill = str(source.get("fill") or "").strip().lower()
+    stroke = str(source.get("stroke") or "").strip().lower()
+    sw = _num(source.get("stroke_width"), 0)
+    return (
+        fill not in {"", "none", "transparent", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)"}
+        or (stroke not in {"", "none", "transparent", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)"} and sw > 0)
+    )
+
+
+def _bbox_contains_center(container: dict[str, Any] | None, child: dict[str, Any] | None, *, pad: float = 2.0) -> bool:
+    c = _bbox(container)
+    b = _bbox(child)
+    if not c or not b:
+        return False
+    cx = b["x"] + b["width"] / 2
+    cy = b["y"] + b["height"] / 2
+    return (
+        cx >= c["x"] - pad and cx <= c["x"] + c["width"] + pad
+        and cy >= c["y"] - pad and cy <= c["y"] + c["height"] + pad
+    )
+
+
+def _source_has_material_icon_inside(source: dict[str, Any], material_icon_sources: list[dict[str, Any]] | None, *, token: str | None = None) -> bool:
+    """Detect rendered Material Symbol children so we do not infer duplicates."""
+    if not material_icon_sources:
+        return False
+    src_ref = str(source.get("source_ref") or "")
+    b = _bbox(source.get("bbox"))
+    if not b:
+        return False
+    token_norm = str(token or "").strip().lower()
+    for icon in material_icon_sources:
+        if str(icon.get("source_ref") or "") == src_ref:
+            continue
+        if token_norm and str(icon.get("text") or "").strip().lower() != token_norm:
+            continue
+        if _bbox_contains_center(b, icon.get("bbox"), pad=4):
+            return True
+    return False
+
+
+def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material_icon_sources: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     kind = str(source.get("kind") or "").lower()
     role = str(source.get("role") or "").lower()
     tag = str(source.get("tag") or "").lower()
     text = str(source.get("text") or "").strip()
+    rendered_icons_enabled = _rendered_import_icons_enabled()
     out: list[dict[str, Any]] = []
+
+    # v06.12: Material Symbols are text ligatures, but semantically they are
+    # icon glyphs. Handle them before generic span/text mapping so Penpot gets
+    # a create_icon op with the Material Symbols font instead of normal body text.
+    if _is_material_symbol_glyph_source(source):
+        icon_target = _target_from_source(
+            source,
+            index,
+            name_suffix="Text",
+            slot="source_element",
+            kind="icon",
+            role="icon",
+            text=text,
+            extra={
+                "component_type": "icon_glyph",
+                "is_material_symbol": True,
+                "material_symbol_name": text,
+            },
+            rule_id="icon.material_symbol_glyph",
+        )
+        out.append(icon_target)
+        return out
+
+    # Icon wrappers are not glyphs. If they have visible paint they become
+    # surfaces, otherwise they are layout-only and intentionally produce no
+    # Penpot layer. This avoids duplicated/overlaid symbols when
+    # STITCH_RENDERED_IMPORT_ICONS=1 exposes the real glyph span separately.
+    if kind == "icon" or role == "icon":
+        if _source_has_visible_paint(source):
+            surf = _target_from_source(
+                source, index, name_suffix="Surface", slot="source_element",
+                kind="surface", role="media", rule_id="icon.container_surface",
+                extra={"component_type": "icon_container"},
+            )
+            surf.pop("text", None)
+            out.append(surf)
+        return out
 
     # Text nodes are direct 1:1 mappings.
     if kind in {"text", "heading"} or tag in {"h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "label", "a", "li", "small"}:
@@ -795,7 +932,9 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int) -> list[
         out.append(field)
 
         icon = _input_icon_for_source(source)
-        if icon:
+        # If the rendered DOM already contains a Material Symbols glyph inside
+        # this field, do not generate an inferred duplicate.
+        if icon and not rendered_icons_enabled and not _source_has_material_icon_inside(source, material_icon_sources, token=icon):
             icon_target = _target_from_source(
                 source,
                 index,
@@ -833,6 +972,10 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int) -> list[
         fill = str(source.get("fill") or "").strip().lower()
         has_container = bool(fill and fill not in {"transparent", "none", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)"}) or (b and b["height"] > 28)
         human_text, icon_tokens = _text_parts_without_icon_tokens(text)
+        has_rendered_icon = any(
+            _source_has_material_icon_inside(source, material_icon_sources, token=tok)
+            for tok in icon_tokens
+        )
         if not has_container:
             out.append(_target_from_source(source, index, name_suffix="ActionText", slot="source_element", kind="text", role="action", text=text, rule_id="action.text_only"))
             return out
@@ -858,7 +1001,7 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int) -> list[
                 rule_id="action.label_slot",
             )
             out.append(text_target)
-        for pos, icon in enumerate(icon_tokens[:1]):
+        for pos, icon in enumerate([] if (rendered_icons_enabled or has_rendered_icon) else icon_tokens[:1]):
             icon_target = _target_from_source(
                 source,
                 index,
@@ -925,11 +1068,13 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     """
     fallback_sanitized, sanitize_summary = sanitize_external_design_spec_for_import(fallback_spec)
     sources = _ensure_source_traces([c for c in (fallback_sanitized.get("children") or []) if isinstance(c, dict)])
+    material_icon_sources = [src for src in sources if _is_material_symbol_glyph_source(src)]
+    rendered_icons_enabled = _rendered_import_icons_enabled()
     transformed: list[dict[str, Any]] = []
     rule_counts: dict[str, int] = {}
     relation_pairs: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
-        targets = _transform_one_source_to_penpot(source, index)
+        targets = _transform_one_source_to_penpot(source, index, material_icon_sources)
         for target in targets:
             dt = target.get("deterministic_transform") if isinstance(target.get("deterministic_transform"), dict) else {}
             rule_id = str(dt.get("rule_id") or "unknown")
@@ -946,7 +1091,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
 
     transform_summary = {
         "schema": "dvcp.deterministic_transform_summary.v1",
-        "version": "v06.10",
+        "version": "v06.12",
         "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
         "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
         "source_domain": "StitchRenderedElement",
@@ -954,6 +1099,12 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "source_count": len(sources),
         "target_count": len(transformed),
         "rule_counts": rule_counts,
+        "material_symbol_source_count": len(material_icon_sources),
+        "icon_inference": {
+            "enabled": not rendered_icons_enabled,
+            "mode": "fallback_when_STITCH_RENDERED_IMPORT_ICONS_is_0" if not rendered_icons_enabled else "disabled_by_STITCH_RENDERED_IMPORT_ICONS",
+            "rendered_import_icons": rendered_icons_enabled,
+        },
         "relation_pair_count": len(relation_pairs),
         "relation_pairs_preview": relation_pairs[:40],
     }
@@ -963,7 +1114,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "target_count": len(transformed),
         "matched_count": len(transformed),
         "unmatched_count": 0,
-        "strategy": "deterministic_transform_T_v06_10_source_to_penpot",
+        "strategy": "deterministic_transform_T_v06_12_source_to_penpot",
         "deterministic_transform": transform_summary,
         "source_fidelity": source_fidelity_summary,
     }
@@ -986,7 +1137,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     spec["metadata"] = meta
     summary = {
         "used": False,
-        "reason": "deterministic_transform_T_v06_10",
+        "reason": "deterministic_transform_T_v06_12",
         "planner": "disabled_for_structure",
         "deterministic": True,
         "fallback_child_count": len(sources),

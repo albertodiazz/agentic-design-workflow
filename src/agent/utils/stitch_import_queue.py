@@ -461,7 +461,7 @@ def _visual_context_for(item: dict[str, Any], items: list[dict[str, Any]], token
 SOURCE_EXPECTED_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
     "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
-    "box_shadow", "input_type",
+    "box_shadow", "input_type", "is_material_symbol", "material_symbol_name",
 )
 
 
@@ -569,6 +569,11 @@ def _comparison_profile_for(trace: dict[str, Any], source_snapshot: dict[str, An
     elif component_type in {"control"} or kind in {"control", "toggle", "checkbox", "radio"} or role in {"control", "checkbox", "radio", "switch"}:
         fields = {"bbox", "fill", "stroke", "stroke_width", "radius", "opacity"}
         intent = "control"
+    elif component_type == "icon_container":
+        # v06.12: visible wrappers around icon glyphs are surfaces. Compare
+        # their own fill/radius, not glyph color/font properties.
+        fields = {"bbox", "fill", "stroke", "stroke_width", "radius", "opacity", "box_shadow"}
+        intent = "icon_container_surface"
     elif slot_kind == "icon" or component_type in {"media"} or kind in {"icon", "svg", "media"} or role in {"icon", "media", "image", "avatar"}:
         fields = {"bbox", "fill", "color", "opacity"}
         if expected.get("text") is not None or op_values.get("text") is not None:
@@ -623,7 +628,7 @@ def _line_height_values_equivalent(expected: Any, actual: Any, op_values: dict[s
     act = _num(actual, 0)
     if exp <= 0 and act <= 0:
         return True
-    # v06.10: CSS/source line-height may be px, while Penpot behaves more
+    # v06.12: CSS/source line-height may be px, while Penpot behaves more
     # predictably with a unitless ratio. If the source px is preserved in the
     # op, the mapping is faithful even when op.line_height is the Penpot ratio.
     src_px = _num(op_values.get("source_line_height_px"), 0)
@@ -773,6 +778,8 @@ def _slot_kind_for_trace(trace: dict[str, Any], source_snapshot: dict[str, Any],
     target_component_type = str(trace.get("component_type") or "").lower()
     source_kind = str(source_snapshot.get("kind") or "").lower()
     source_role = str(source_snapshot.get("role") or "").lower()
+    if target_component_type == "icon_container":
+        return "source_element"
     if slot in {"leading_icon", "trailing_icon", "icon"} or target_kind in {"icon", "svg"}:
         return "icon"
     if slot in {"label", "placeholder", "content", "trailing_action"} or _is_text_like_trace(target_kind, target_role, slot, target_component_type):
@@ -838,15 +845,15 @@ def _project_expected_for_slot(
             out.pop(key, None)
 
     elif slot_kind == "icon":
-        # v06.10: icon slots project the parent source into a glyph expectation.
-        # A source fill usually represents the input/button surface; the icon
-        # paint should come from computed text color. This prevents false drifts
-        # such as expected button fill vs actual white glyph.
-        for key in (
-            "fill", "font_size", "font_weight", "font_family", "line_height",
-            "text_align", "box_shadow", "input_type", "stroke", "stroke_width",
-            "radius",
-        ):
+        # v06.12: distinguish real Material Symbols glyphs from inferred icon
+        # slots. Real glyphs must preserve the icon-font family and ligature
+        # text; inferred slots still compare only bbox/paint/text.
+        fam = str(expected.get("font_family") or expected.get("source_font_family") or op_values.get("font_family") or op_values.get("source_font_family") or "").lower()
+        is_material_symbol = bool(expected.get("is_material_symbol") or op_values.get("is_material_symbol") or "material symbols" in fam or "material icons" in fam)
+        pop_keys = ["box_shadow", "input_type", "stroke", "stroke_width", "radius"]
+        if not is_material_symbol:
+            pop_keys += ["font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align"]
+        for key in pop_keys:
             out.pop(key, None)
         icon_color = (
             expected.get("color")
@@ -859,6 +866,11 @@ def _project_expected_for_slot(
             out["fill"] = icon_color
             out["color"] = icon_color
             notes.append("icon_paint_projected_from_source_color")
+        if is_material_symbol:
+            out["is_material_symbol"] = True
+            out["material_symbol_name"] = op_values.get("material_symbol_name") or expected.get("material_symbol_name") or op_values.get("text") or expected.get("text")
+            out.setdefault("penpot_line_height_ratio", 1)
+            notes.append("material_symbol_font_expected")
         if op_values.get("text") is not None:
             out["text"] = op_values.get("text")
             notes.append("icon_identity_from_penpot_op")
@@ -869,7 +881,7 @@ def _project_expected_for_slot(
 
     return {
         "schema": "dvcp.source_slot_projection.v1",
-        "version": "v06.10",
+        "version": "v06.12",
         "source_ref": source_snapshot.get("source_ref"),
         "slot_kind": slot_kind,
         "slot": trace.get("slot"),
@@ -1045,7 +1057,7 @@ def _style_drift_diagnostics(
                     "autofixable": True,
                 })
 
-    # v06.10: readback font fidelity diagnostics. Family fallback is a warning,
+    # v06.12: readback font fidelity diagnostics. Family fallback is a warning,
     # but weight mismatch is a real visual issue because Stitch explicitly
     # specifies weights such as Inter 700 for headings.
     if shape_ids and ({"font_family", "font_weight"} & set(fields)):
@@ -1053,15 +1065,21 @@ def _style_drift_diagnostics(
         actual_font = rb_style.get("fontFamily") if isinstance(rb_style, dict) else None
         expected_font = expected.get("font_family") or op_values.get("font_family") or op_values.get("source_font_family")
         if expected_font and actual_font and _normalise_font_name(expected_font) != _normalise_font_name(actual_font):
-            warnings.append({
-                "category": "font_family_fallback",
+            expected_norm = _normalise_font_name(expected_font)
+            is_material_expected = "materialsymbols" in expected_norm or "materialicons" in expected_norm
+            item = {
+                "category": "material_symbol_font_mismatch" if is_material_expected else "font_family_fallback",
                 "field": "font_family",
-                "severity": "low",
+                "severity": "high" if is_material_expected else "low",
                 "expected": expected_font,
                 "actual": actual_font,
-                "message": "Penpot readback font differs from the source font; layout/content passed but font fidelity is approximate.",
-                "autofixable": False,
-            })
+                "message": "Material Symbol glyph rendered with a normal text font; the ligature will appear as a word." if is_material_expected else "Penpot readback font differs from the source font; layout/content passed but font fidelity is approximate.",
+                "autofixable": bool(is_material_expected),
+            }
+            if is_material_expected:
+                issues.append(item)
+            else:
+                warnings.append(item)
         expected_weight = expected.get("font_weight") or op_values.get("font_weight")
         actual_weight = rb_style.get("fontWeight") if isinstance(rb_style, dict) else None
         if actual_weight is None and expected_weight is not None:
@@ -1081,7 +1099,7 @@ def _style_drift_diagnostics(
                 "severity": "medium",
                 "expected": expected_weight,
                 "actual": actual_weight,
-                "message": "Penpot text weight differs from Stitch computed style; dynamic text style bridge should preserve the source weight.",
+                "message": "Penpot text weight differs from Stitch computed style; material symbol fidelity should preserve the source weight.",
                 "autofixable": True,
             })
 
@@ -1195,7 +1213,7 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     report = {
         "schema": "dvcp.source_penpot_deterministic_report.v6",
         "mode": "source_map_no_llm",
-        "cleanup": "v06.10_dynamic_text_style_bridge",
+        "cleanup": "v06.12_icon_source_precedence",
         "mapping_count": len(mappings),
         "mapped_shape_count": mapped,
         "issue_count": real_issue_count,
@@ -1323,6 +1341,8 @@ def _item_to_op(
         "opacity",
         "box_shadow",
         "input_type",
+        "is_material_symbol",
+        "material_symbol_name",
         "svg",
         "tag",
         "z_index",
