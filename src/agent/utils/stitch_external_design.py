@@ -549,16 +549,25 @@ _RENDER_JS = r"""
   function stylePayload(el, cs) {
     const borderWidth = Math.max(num(cs.borderTopWidth, 0), num(cs.borderRightWidth, 0), num(cs.borderBottomWidth, 0), num(cs.borderLeftWidth, 0));
     const radius = Math.max(num(cs.borderTopLeftRadius, 0), num(cs.borderTopRightRadius, 0), num(cs.borderBottomRightRadius, 0), num(cs.borderBottomLeftRadius, 0));
+    const fontSize = num(cs.fontSize, 14);
+    const rawLineHeight = String(cs.lineHeight || '').toLowerCase();
+    let sourceLineHeightPx = num(cs.lineHeight, 0);
+    if (!sourceLineHeightPx || rawLineHeight === 'normal') sourceLineHeightPx = fontSize * 1.2;
+    const penpotLineHeightRatio = Math.max(1, Math.min(2.4, sourceLineHeightPx / Math.max(fontSize, 1)));
+    const sourceFontFamily = String(cs.fontFamily || '').split(',')[0].replace(/["']/g, '').trim();
     return {
       color: colorToHex(cs.color, '#0F172A'),
       fill: colorToHex(cs.backgroundColor, null),
       stroke: borderWidth > 0 ? colorToHex(cs.borderTopColor, '#CBD5E1') : null,
       stroke_width: borderWidth || 0,
       radius: radius || 0,
-      font_size: num(cs.fontSize, 14),
+      font_size: fontSize,
       font_weight: String(cs.fontWeight || '400'),
-      font_family: String(cs.fontFamily || '').split(',')[0].replace(/["']/g, '').trim(),
-      line_height: 1.2,
+      font_family: sourceFontFamily,
+      source_font_family: sourceFontFamily,
+      source_line_height_px: Math.round(sourceLineHeightPx * 100) / 100,
+      penpot_line_height_ratio: Math.round(penpotLineHeightRatio * 1000) / 1000,
+      line_height: Math.round(sourceLineHeightPx * 100) / 100,
       text_align: cs.textAlign || 'left',
       opacity: Number(cs.opacity || 1),
       box_shadow: cs.boxShadow && cs.boxShadow !== 'none' ? cs.boxShadow : null,
@@ -818,7 +827,7 @@ def _dedupe_rendered_nodes(nodes: list[dict[str, Any]], viewport_width: int, vie
 
 SOURCE_SNAPSHOT_STYLE_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
-    "font_family", "line_height", "text_align", "radius", "opacity", "fill_opacity",
+    "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
     "box_shadow", "input_type",
 )
 
@@ -918,7 +927,7 @@ def rendered_nodes_to_children(rendered: dict[str, Any], *, width: int, height: 
             child["svg"] = node.get("svg")
         for key in [
             "color", "fill", "stroke", "stroke_width", "radius", "font_size", "font_weight", "font_family",
-            "line_height", "text_align", "opacity", "box_shadow", "input_type", "is_icon",
+            "line_height", "source_line_height_px", "penpot_line_height_ratio", "source_font_family", "text_align", "opacity", "box_shadow", "input_type", "is_icon",
         ]:
             value = node.get(key)
             if value is not None and value != "":

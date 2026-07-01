@@ -460,7 +460,7 @@ def _visual_context_for(item: dict[str, Any], items: list[dict[str, Any]], token
 
 SOURCE_EXPECTED_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
-    "font_family", "line_height", "text_align", "radius", "opacity", "fill_opacity",
+    "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
     "box_shadow", "input_type",
 )
 
@@ -601,7 +601,9 @@ def _field_values_equal(field: str, expected: Any, actual: Any) -> bool:
         return True
     if expected is None or actual is None:
         return False
-    if field in {"x", "y", "width", "height", "font_size", "line_height", "radius", "stroke_width", "opacity", "fill_opacity"}:
+    if field in {"x", "y", "width", "height", "font_size", "radius", "stroke_width", "opacity", "fill_opacity"}:
+        return abs(_num(actual, 0) - _num(expected, 0)) <= 0.75
+    if field == "line_height":
         return abs(_num(actual, 0) - _num(expected, 0)) <= 0.75
     if field == "font_weight":
         return _norm_cmp(expected) == _norm_cmp(actual)
@@ -609,6 +611,46 @@ def _field_values_equal(field: str, expected: Any, actual: Any) -> bool:
         return _norm_cmp(expected).replace(" ", "") == _norm_cmp(actual).replace(" ", "")
     return _norm_cmp(expected) == _norm_cmp(actual)
 
+
+
+
+def _line_height_values_equivalent(expected: Any, actual: Any, op_values: dict[str, Any]) -> bool:
+    if expected is None and actual is None:
+        return True
+    if expected is None or actual is None:
+        return False
+    exp = _num(expected, 0)
+    act = _num(actual, 0)
+    if exp <= 0 and act <= 0:
+        return True
+    # v06.9: CSS/source line-height may be px, while Penpot behaves more
+    # predictably with a unitless ratio. If the source px is preserved in the
+    # op, the mapping is faithful even when op.line_height is the Penpot ratio.
+    src_px = _num(op_values.get("source_line_height_px"), 0)
+    ratio = _num(op_values.get("penpot_line_height_ratio"), 0)
+    font_size = max(_num(op_values.get("font_size"), 14), 1)
+    if exp > 4 and act <= 4:
+        return abs(src_px - exp) <= 0.75 or abs(act - (exp / font_size)) <= 0.05 or abs(ratio - (exp / font_size)) <= 0.05
+    if exp <= 4 and act > 4:
+        return abs((act / font_size) - exp) <= 0.05
+    return abs(act - exp) <= 0.75
+
+
+def _normalise_font_name(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace('"', '').replace("'", "")
+    if not raw:
+        return ""
+    raw = raw.split(',')[0].strip()
+    return re.sub(r"[^a-z0-9]+", "", raw)
+
+
+def _first_readback_text_style(readbacks: list[dict[str, Any]]) -> dict[str, Any]:
+    for read in readbacks or []:
+        if not isinstance(read, dict):
+            continue
+        if read.get("characters") is not None or read.get("text") is not None or read.get("fontFamily") is not None:
+            return read
+    return {}
 
 def _readback_root_origin(results: list[dict[str, Any]]) -> dict[str, float]:
     for result in results:
@@ -774,7 +816,7 @@ def _project_expected_for_slot(
             out.pop(key, None)
 
     elif slot_kind == "icon":
-        # v06.8: icon slots project the parent source into a glyph expectation.
+        # v06.9: icon slots project the parent source into a glyph expectation.
         # A source fill usually represents the input/button surface; the icon
         # paint should come from computed text color. This prevents false drifts
         # such as expected button fill vs actual white glyph.
@@ -805,7 +847,7 @@ def _project_expected_for_slot(
 
     return {
         "schema": "dvcp.source_slot_projection.v1",
-        "version": "v06.8",
+        "version": "v06.9",
         "source_ref": source_snapshot.get("source_ref"),
         "slot_kind": slot_kind,
         "slot": trace.get("slot"),
@@ -911,6 +953,8 @@ def _style_drift_diagnostics(
                 "actual": None,
                 "autofixable": True,
             })
+        elif key == "line_height" and _line_height_values_equivalent(value, op_values.get(key), op_values):
+            continue
         elif not _field_values_equal(key, value, op_values.get(key)):
             if _mismatched_field_is_diagnostic_warning(key):
                 warnings.append({
@@ -978,6 +1022,34 @@ def _style_drift_diagnostics(
                     "coordinate_space": "root_relative",
                     "autofixable": True,
                 })
+
+    # v06.9: readback font fidelity diagnostics. The op may faithfully carry
+    # Inter, while a local Penpot runtime falls back to Source Sans Pro. That is
+    # a visual-fidelity warning, not a structure/source mapping issue.
+    if "font_family" in fields and shape_ids:
+        rb_style = _first_readback_text_style(readback_normalized)
+        actual_font = rb_style.get("fontFamily") if isinstance(rb_style, dict) else None
+        expected_font = expected.get("font_family") or op_values.get("font_family") or op_values.get("source_font_family")
+        if expected_font and actual_font and _normalise_font_name(expected_font) != _normalise_font_name(actual_font):
+            warnings.append({
+                "category": "font_family_fallback",
+                "field": "font_family",
+                "severity": "low",
+                "expected": expected_font,
+                "actual": actual_font,
+                "message": "Penpot readback font differs from the source font; layout/content passed but font fidelity is approximate.",
+                "autofixable": False,
+            })
+        if rb_style.get("fontWeight") is None and op_values.get("font_weight") is not None:
+            warnings.append({
+                "category": "font_weight_readback_unavailable",
+                "field": "font_weight",
+                "severity": "info",
+                "expected": op_values.get("font_weight"),
+                "actual": None,
+                "message": "Penpot readback did not expose fontWeight, so weight fidelity cannot be verified deterministically.",
+                "autofixable": False,
+            })
 
     high = sum(1 for issue in issues if issue.get("severity") == "high")
     medium = sum(1 for issue in issues if issue.get("severity") == "medium")
@@ -1087,9 +1159,9 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     real_issue_count = sum(issue_counts.values())
     warning_count = sum(warning_counts.values())
     report = {
-        "schema": "dvcp.source_penpot_deterministic_report.v5",
+        "schema": "dvcp.source_penpot_deterministic_report.v6",
         "mode": "source_map_no_llm",
-        "cleanup": "v06.8_native_visual_materialization",
+        "cleanup": "v06.9_text_fidelity_line_height_font_diagnostics",
         "mapping_count": len(mappings),
         "mapped_shape_count": mapped,
         "issue_count": real_issue_count,
@@ -1110,6 +1182,39 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     }
     return mappings, report
 
+
+
+
+def _normalise_text_fidelity_fields(op: dict[str, Any]) -> None:
+    kind = str(op.get("kind") or "").lower()
+    role = str(op.get("role") or "").lower()
+    slot = str(op.get("slot") or "").lower()
+    has_text = op.get("text") is not None or kind == "text" or slot in {"label", "content", "text_slot"} or role in {"label", "heading", "body_text", "link", "button_text", "placeholder"}
+    if not has_text:
+        return
+    font_size = max(_num(op.get("font_size"), 14), 1)
+    raw_lh = op.get("line_height")
+    if raw_lh is None or raw_lh == "":
+        source_px = font_size * 1.2
+        ratio = 1.2
+    else:
+        lh = _num(raw_lh, 0)
+        if lh > 4:
+            source_px = lh
+            ratio = source_px / font_size
+        elif lh > 0:
+            ratio = lh
+            source_px = _num(op.get("source_line_height_px"), font_size * ratio)
+        else:
+            source_px = font_size * 1.2
+            ratio = 1.2
+    ratio = max(1.0, min(2.4, ratio))
+    op.setdefault("source_line_height_px", round(source_px, 3))
+    op["penpot_line_height_ratio"] = round(ratio, 3)
+    # Penpot receives a ratio in line_height; source px is preserved separately.
+    op["line_height"] = round(ratio, 3)
+    if op.get("font_family") and not op.get("source_font_family"):
+        op["source_font_family"] = op.get("font_family")
 
 def _item_to_op(
     item: dict[str, Any],
@@ -1171,7 +1276,10 @@ def _item_to_op(
         "font_size",
         "font_weight",
         "font_family",
+        "source_font_family",
         "line_height",
+        "source_line_height_px",
+        "penpot_line_height_ratio",
         "text_align",
         "radius",
         "fill",
@@ -1200,6 +1308,8 @@ def _item_to_op(
     ):
         if item.get(style_key) is not None:
             base[style_key] = item.get(style_key)
+
+    _normalise_text_fidelity_fields(base)
 
     # Refresh op values after optional visual fields were copied.
     base["source_trace"]["penpot_op_values"] = _op_visual_values(base)

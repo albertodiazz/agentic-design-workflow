@@ -8,7 +8,7 @@ from typing import Any
 ALLOWED_KINDS = {"screen_root", "surface", "container", "card", "section", "navigation", "data_display", "table", "chart", "text", "heading", "input", "button", "control", "icon", "svg", "media"}
 VISUAL_KEYS = (
     "tag", "text", "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
-    "font_family", "line_height", "text_align", "radius", "opacity", "fill_opacity", "box_shadow",
+    "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity", "box_shadow",
     "input_type", "svg", "css_class", "id_attr", "dom_path", "source_ref", "source_snapshot",
     "z_index", "layer_order", "component_id",
     "component_type", "attach_to", "slot", "deterministic_transform", "ghost", "allow_no_shape",
@@ -120,7 +120,7 @@ def _iter_plan_children(plan: dict[str, Any]) -> list[dict[str, Any]]:
 
 SOURCE_EXPECTED_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
-    "font_family", "line_height", "text_align", "radius", "opacity", "fill_opacity",
+    "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
     "box_shadow", "input_type",
 )
 
@@ -353,7 +353,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
     v06.4 exposed that many remaining visual drifts were introduced before
     Penpot: strokes/radii/footer height/action colors had been normalized by
     the LLM or tokens even though the Playwright source carried exact computed
-    values. v06.8 applies a deterministic precedence rule:
+    values. v06.9 applies a deterministic precedence rule:
 
         rendered source style > LLM planned value > token fallback > default
 
@@ -387,23 +387,23 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
             # authoritative. This preserves original borders/radii/sizes.
             _copy_present(item, expected, ("bbox", "fill", "stroke", "stroke_width", "radius", "opacity", "fill_opacity", "box_shadow"))
             if fidelity_kind == "action" and item.get("text") is not None:
-                _copy_present(item, expected, ("color", "text_color", "font_size", "font_weight", "font_family", "line_height", "text_align"))
+                _copy_present(item, expected, ("color", "text_color", "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align"))
                 if expected.get("text") is not None and not item.get("text"):
                     item["text"] = expected.get("text")
         elif fidelity_kind == "text":
-            _copy_present(item, expected, ("bbox", "text", "color", "text_color", "font_size", "font_weight", "font_family", "line_height", "text_align", "opacity"))
+            _copy_present(item, expected, ("bbox", "text", "color", "text_color", "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "opacity"))
         elif fidelity_kind == "text_slot":
             # Text slots inside inputs/buttons keep planned bbox/text (e.g.
             # 'Acceder' rather than 'Acceder arrow_forward') but should inherit
             # exact computed typography/color from the source parent.
-            _copy_present(item, expected, ("color", "text_color", "font_size", "font_weight", "font_family", "line_height", "text_align", "opacity"))
+            _copy_present(item, expected, ("color", "text_color", "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "opacity"))
             source_text = _norm_text(expected.get("text"))
             item_text = _norm_text(item.get("text"))
             if source_text and item_text and item_text not in source_text:
                 # Keep planned text when it is not a reliable substring.
                 pass
         elif fidelity_kind == "icon":
-            # v06.8: an icon slot represents a glyph, not its parent surface.
+            # v06.9: an icon slot represents a glyph, not its parent surface.
             # CSS `fill` on the source often means input/button background; the
             # glyph paint should come from computed text color. Keep the target
             # bbox/text, project glyph color deterministically, and drop
@@ -421,7 +421,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
             _copy_present(item, expected, ("opacity",), overwrite=True)
             for inherited_key in (
                 "stroke", "stroke_width", "radius", "box_shadow", "input_type",
-                "font_size", "font_weight", "font_family", "line_height", "text_align",
+                "font_size", "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align",
             ):
                 item.pop(inherited_key, None)
         else:
@@ -434,7 +434,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         item["source_fidelity"] = {
             "schema": "dvcp.source_fidelity.v1",
             "mode": "computed_source_authority",
-            "version": "v06.8",
+            "version": "v06.9",
             "applied": bool(changed),
             "fidelity_kind": fidelity_kind,
             "copied_fields": changed,
@@ -443,7 +443,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         out.append(item)
     return out, {
         "schema": "dvcp.source_fidelity_summary.v1",
-        "version": "v06.8",
+        "version": "v06.9",
         "strategy": "computed_source_style_authority_icon_slot_fidelity",
         "target_count": len(children),
         "planned_source_count": planned_count,
@@ -484,7 +484,7 @@ def _attach_source_traces(children: list[dict[str, Any]], sources: list[dict[str
         "target_count": len(out),
         "matched_count": matched,
         "unmatched_count": unmatched,
-        "strategy": "bbox_text_kind_role_nearest_source_match_v06_8_native_visual_materialization",
+        "strategy": "bbox_text_kind_role_nearest_source_match_v06_9_text_fidelity",
     }
 
 
@@ -586,7 +586,7 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
 
 
 # -----------------------------------------------------------------------------
-# v06.8 deterministic Stitch -> Penpot transform
+# v06.9 deterministic Stitch -> Penpot transform
 # -----------------------------------------------------------------------------
 # Formal intent:
 #   S = set of rendered Stitch source elements
@@ -664,7 +664,7 @@ def _target_from_source(
         "slot": slot,
         "deterministic_transform": {
             "schema": "dvcp.deterministic_transform.v1",
-            "version": "v06.8",
+            "version": "v06.9",
             "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
             "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
             "source_domain": "StitchRenderedElement",
@@ -679,7 +679,7 @@ def _target_from_source(
     # will enforce final precedence again after the transform.
     for key in (
         "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
-        "font_family", "line_height", "text_align", "radius", "opacity", "fill_opacity",
+        "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
         "box_shadow", "input_type", "tag", "css_class", "dom_path", "id_attr",
     ):
         if source.get(key) is not None and source.get(key) != "":
@@ -946,7 +946,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
 
     transform_summary = {
         "schema": "dvcp.deterministic_transform_summary.v1",
-        "version": "v06.8",
+        "version": "v06.9",
         "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
         "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
         "source_domain": "StitchRenderedElement",
@@ -963,7 +963,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "target_count": len(transformed),
         "matched_count": len(transformed),
         "unmatched_count": 0,
-        "strategy": "deterministic_transform_T_v06_8_source_to_penpot",
+        "strategy": "deterministic_transform_T_v06_9_source_to_penpot",
         "deterministic_transform": transform_summary,
         "source_fidelity": source_fidelity_summary,
     }
@@ -986,7 +986,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     spec["metadata"] = meta
     summary = {
         "used": False,
-        "reason": "deterministic_transform_T_v06_8",
+        "reason": "deterministic_transform_T_v06_9",
         "planner": "disabled_for_structure",
         "deterministic": True,
         "fallback_child_count": len(sources),
