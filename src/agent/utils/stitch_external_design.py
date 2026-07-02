@@ -134,6 +134,29 @@ def is_material_icon_text(value: str) -> bool:
     return text in MATERIAL_SYMBOL_TEXTS or bool(re.fullmatch(r"[a-z]+(?:_[a-z]+)+", text))
 
 
+def rendered_node_uses_material_icon_font_or_class(node: dict[str, Any]) -> bool:
+    """Return true only when the rendered node itself is an icon-font node.
+
+    Some real labels are words that also happen to be Material Symbol ligature
+    tokens, for example Home or Settings in a bottom navigation.  Those must
+    remain text when their source font/class is normal.  The icon-token filter
+    should only remove nodes that actually came from Material Symbols/Icons.
+    """
+    css = str(node.get("css_class") or "").lower()
+    family = str(node.get("font_family") or node.get("source_font_family") or "").lower()
+    kind = str(node.get("kind") or "").lower()
+    role = str(node.get("role") or "").lower()
+    return (
+        bool(node.get("is_icon"))
+        or kind == "icon"
+        or role == "icon"
+        or "material-symbol" in css
+        or "material-icons" in css
+        or "material symbols" in family
+        or "material icons" in family
+    )
+
+
 def slug_words(value: str, fallback: str = "Item") -> str:
     words = re.findall(r"[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ]+", value or "")
     words = [w for w in words if w.lower() not in {"the", "and", "for", "con", "para", "de", "la", "el", "un", "una"}]
@@ -603,6 +626,7 @@ _RENDER_JS = r"""
   }
 
   const nodes = [];
+  const ignoredImages = [];
   const all = Array.from(document.body ? document.body.querySelectorAll('*') : document.querySelectorAll('*'));
 
   for (const el of all) {
@@ -614,7 +638,9 @@ _RENDER_JS = r"""
 
     const fullText = clean(el.innerText || el.textContent || '');
     const dText = directText(el);
-    const iconLike = hasIconClass(el) || isIconText(fullText);
+    const fontFamilyLower = String(cs.fontFamily || '').toLowerCase();
+    const iconFontLike = fontFamilyLower.includes('material symbols') || fontFamilyLower.includes('material icons');
+    const iconLike = hasIconClass(el) || (iconFontLike && isIconText(fullText));
 
     if (iconLike) {
       if (importIcons && fullText) pushNode(nodes, el, 'icon', 'icon', fullText, { is_icon: true });
@@ -628,8 +654,17 @@ _RENDER_JS = r"""
     }
 
     if (tag === 'img') {
-      const alt = el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('aria-label') || 'Image';
-      pushNode(nodes, el, 'media', 'media', alt, { src_present: !!el.getAttribute('src') });
+      // v06.13.4+ strict media rule: images are currently out of scope for the
+      // Penpot import. Do not create fallback surfaces or placeholders; the
+      // design stays deterministic by explicitly ignoring <img> elements.
+      ignoredImages.push({
+        tag: 'img',
+        bbox: { x: r.x, y: r.y, width: r.width, height: r.height },
+        alt: String(el.getAttribute('alt') || el.getAttribute('data-alt') || '').slice(0, 250),
+        css_class: String(el.className || '').slice(0, 250),
+        dom_path: domPath(el),
+        reason: 'strict_img_ignored_not_imported_to_penpot'
+      });
       continue;
     }
 
@@ -655,13 +690,24 @@ _RENDER_JS = r"""
       continue;
     }
 
-    if (textTags.has(tag) && fullText && !ancestorMatches(el, 'button') && !ancestorMatches(el, 'input, textarea, select')) {
+    if (textTags.has(tag) && fullText && !ancestorMatches(el, 'input, textarea, select')) {
+      const insideButton = ancestorMatches(el, 'button, [role="button"]');
+      const hasTextChild = hasVisibleTextChild(el);
       let txt = dText || fullText;
-      if (hasVisibleTextChild(el) && tag !== 'label' && !/^h[1-6]$/.test(tag)) continue;
-      if (isIconText(txt)) continue;
+      // Exact source-to-layer fidelity: do not materialize text on a parent
+      // element when its displayed string is only inherited from a textual
+      // descendant. Example: <label><input/><span>Recordar sesión</span></label>
+      // must produce the span text layer only, not a duplicated label layer.
+      // v06.13.4: text leaves inside buttons are valid source elements. This
+      // lets bottom-nav/button layouts map the real <span> label instead of a
+      // projected label from button.textContent.
+      if (hasTextChild && !dText) continue;
+      if (hasTextChild && tag !== 'label' && !/^h[1-6]$/.test(tag)) continue;
+      if (iconFontLike && isIconText(txt)) continue;
       let role = /^h[1-6]$/.test(tag) ? 'heading' : 'body_text';
       if (tag === 'label') role = 'label';
-      pushNode(nodes, el, 'text', role, txt, {});
+      if (insideButton) role = 'button_text';
+      pushNode(nodes, el, 'text', role, txt, { direct_text: dText, text_from_descendants: hasTextChild && !dText, inside_button: insideButton });
       continue;
     }
 
@@ -689,7 +735,9 @@ _RENDER_JS = r"""
     title: document.title || '',
     viewport: { width: viewportW, height: viewportH },
     document: { width: documentWidth, height: documentHeight },
-    nodes
+    nodes,
+    ignored_img_count: ignoredImages.length,
+    ignored_img_preview: ignoredImages.slice(0, 20)
   };
 }
 """
@@ -798,7 +846,10 @@ def _dedupe_rendered_nodes(nodes: list[dict[str, Any]], viewport_width: int, vie
         text = clean_text(str(node.get("text") or ""))
         if text and is_resource_ref(text):
             continue
-        if kind != "icon" and text and is_material_icon_text(text):
+        # v06.13.6: do not drop normal-font labels whose visible text is also
+        # a Material Symbol token (e.g. "Home", "Settings"). Only filter
+        # icon-like text when the node actually uses an icon font/class.
+        if kind != "icon" and text and is_material_icon_text(text) and rendered_node_uses_material_icon_font_or_class(node):
             continue
         if kind == "text" and not meaningful_text(text):
             continue
@@ -832,14 +883,25 @@ SOURCE_SNAPSHOT_STYLE_KEYS = (
 )
 
 
+def _is_media_child(child: dict[str, Any]) -> bool:
+    kind = str(child.get("kind") or "").lower()
+    role = str(child.get("role") or "").lower()
+    tag = str(child.get("tag") or "").lower()
+    return kind in {"media", "image", "video", "avatar"} or role in {"media", "image", "avatar"} or tag in {"img", "picture", "video", "canvas"}
+
+
 def _compact_source_expected(child: dict[str, Any]) -> dict[str, Any]:
     expected: dict[str, Any] = {"bbox": child.get("bbox") or {}}
     for key in SOURCE_SNAPSHOT_STYLE_KEYS:
         value = child.get(key)
         if value is not None and value != "":
             expected[key] = value
-    if child.get("text") is not None:
+    if child.get("media_alt") is not None:
+        expected["media_alt"] = str(child.get("media_alt") or "")[:500]
+    if child.get("text") is not None and not _is_media_child(child):
         expected["text"] = str(child.get("text") or "")[:500]
+    elif child.get("text") is not None and _is_media_child(child) and expected.get("media_alt") is None:
+        expected["media_alt"] = str(child.get("text") or "")[:500]
     return expected
 
 
@@ -921,8 +983,13 @@ def rendered_nodes_to_children(rendered: dict[str, Any], *, width: int, height: 
             value = node.get(meta_key)
             if value is not None and value != "":
                 child[meta_key] = str(value)[:500]
-        if text:
+        media_alt = clean_text(str(node.get("media_alt") or node.get("alt") or ""), 500)
+        if text and kind != "media":
             child["text"] = text
+        elif kind == "media" and text and not media_alt:
+            child["media_alt"] = text
+        if media_alt:
+            child["media_alt"] = media_alt
         if node.get("svg"):
             child["svg"] = node.get("svg")
         for key in [
@@ -1116,6 +1183,8 @@ def build_external_design_spec_from_stitch(stitch_payload: Dict[str, Any], selec
         "layout_extraction_mode": extraction_mode,
         "rendered_error": rendered_error,
         "rendered_element_count": len(children),
+        "rendered_ignored_img_count": safe_int(rendered.get("ignored_img_count"), 0) if isinstance(rendered, dict) else 0,
+        "rendered_ignored_img_preview": rendered.get("ignored_img_preview") if isinstance(rendered, dict) else [],
         "rendered_viewport": rendered.get("viewport") if isinstance(rendered, dict) else None,
         "rendered_document": rendered.get("document") if isinstance(rendered, dict) else None,
         "imported_icons": _env_bool("STITCH_RENDERED_IMPORT_ICONS", False),

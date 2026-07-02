@@ -423,7 +423,7 @@ function compactOpVisualValues(op) {
   var keys = [
     "text", "fill", "stroke", "stroke_width", "color", "text_color", "font_size",
     "font_weight", "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity",
-    "fill_opacity", "box_shadow", "input_type", "text_no_wrap", "expected_line_count", "source_line_count", "penpot_grow_type"
+    "fill_opacity", "box_shadow", "input_type", "media_alt", "text_no_wrap", "expected_line_count", "source_line_count", "penpot_grow_type"
   ];
   for (var i = 0; i < keys.length; i++) {
     var k = keys[i];
@@ -442,7 +442,7 @@ function compactShapeReadback(shape) {
       if (v !== undefined && v !== null && typeof v !== "function") out[props[i]] = v;
     } catch (err) {}
   }
-  var pd = ["dvcp_grow_type", "text_no_wrap", "expected_line_count", "source_line_count"];
+  var pd = ["dvcp_grow_type", "text_no_wrap", "expected_line_count", "source_line_count", "media_alt"];
   for (var pi = 0; pi < pd.length; pi++) {
     var pv = getPluginDataSafe(shape, pd[pi]);
     if (pv !== undefined && pv !== null && String(pv) !== "") out[pd[pi]] = pv;
@@ -475,7 +475,7 @@ function createVisualMaterializedShape(op, offset) {
   var svg = visualSvgForOp(op);
   var info = {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.13",
+    version: "v06.13.6",
     method: "svg_fallback",
     visually_materialized: false,
     fallback_used: false,
@@ -808,13 +808,12 @@ function textGrowTypeFromOp(op) {
   op = op || {};
   var explicit = String(op.penpot_grow_type || op.growType || op.grow_type || "").trim();
   if (explicit) return explicit;
-  var align = normalizeTextAlign(op.text_align || "left");
   var material = isMaterialSymbolOp(op);
-  // v06.13: one-line left/start labels must not wrap in Penpot. Keep
-  // centered/right text fixed so headings and CTA labels preserve their source
-  // alignment box.
-  if (!material && textNoWrapFromOp(op) && (align === "left" || align === "start")) return "auto-width";
-  if (textNoWrapFromOp(op) && material) return "fixed";
+  // v06.13.6: Stitch rendered line count is the source of truth. Any
+  // non-icon text that Chromium rendered as one visual line must stay no-wrap
+  // in Penpot, including centered headings and CTA labels. Material Symbols
+  // stay fixed because they are glyph icons, not editable prose labels.
+  if (!material && textNoWrapFromOp(op)) return "auto-width";
   return "fixed";
 }
 
@@ -1035,10 +1034,12 @@ function createIconShapes(op, offset) {
     font_weight: normalizeFontWeight(op.font_weight || op.weight || "400"),
     font_family: materialSymbol ? (op.font_family || op.source_font_family || "Material Symbols Outlined") : "",
     source_font_family: materialSymbol ? (op.source_font_family || op.font_family || "Material Symbols Outlined") : (op.source_font_family || op.font_family || ""),
-    text_align: "center",
-    line_height: materialSymbol ? 1 : fontSize + 2,
-    source_line_height_px: materialSymbol ? fontSize : (op.source_line_height_px || fontSize + 2),
-    penpot_line_height_ratio: materialSymbol ? 1 : (op.penpot_line_height_ratio || null),
+    text_align: op.text_align || "center",
+    // Exact fidelity: Material Symbols still use the browser-computed line-height.
+    // Do not force 1; Stitch may compute values such as 40px / 36px = 1.111.
+    line_height: op.line_height !== undefined ? op.line_height : (materialSymbol ? null : fontSize + 2),
+    source_line_height_px: op.source_line_height_px !== undefined ? op.source_line_height_px : (materialSymbol ? null : fontSize + 2),
+    penpot_line_height_ratio: op.penpot_line_height_ratio !== undefined ? op.penpot_line_height_ratio : null,
     opacity: op.opacity === undefined ? 1 : op.opacity
   }));
   var glyphText = materialSymbol ? materialSymbolTextFromOp(op) : iconTextFromOp(op);
@@ -1065,7 +1066,7 @@ function nativeVisualInfo(op, method, created, error) {
   var expectedText = !!op.text;
   return {
     schema: "dvcp.visual_materialization.v1",
-    version: "v06.13",
+    version: "v06.13.6",
     method: method || "native_first",
     materialization_kind: "native_penpot_shapes",
     visually_materialized: created.length > 0,
@@ -1548,7 +1549,7 @@ function applyImportOp(op) {
   if (!result.visual_materialization && op.op !== "create_root" && op.op !== "finalize_import_job") {
     result.visual_materialization = {
       schema: "dvcp.visual_materialization.v1",
-      version: "v06.13",
+      version: "v06.13.6",
       method: "native_fallback_legacy_path",
       visually_materialized: created.length > 0,
       fallback_used: true,
@@ -1590,12 +1591,13 @@ function applyImportOp(op) {
     if (op.source_line_height_px !== undefined) setPluginDataSafe(shape, "source_line_height_px", String(op.source_line_height_px));
     if (op.penpot_line_height_ratio !== undefined) setPluginDataSafe(shape, "penpot_line_height_ratio", String(op.penpot_line_height_ratio));
     if (op.text_no_wrap !== undefined) setPluginDataSafe(shape, "text_no_wrap", String(op.text_no_wrap));
+    if (op.media_alt !== undefined) setPluginDataSafe(shape, "media_alt", String(op.media_alt || ""));
     if (op.expected_line_count !== undefined) setPluginDataSafe(shape, "expected_line_count", String(op.expected_line_count));
     if (op.source_line_count !== undefined) setPluginDataSafe(shape, "source_line_count", String(op.source_line_count));
     var growTypeForShape = (String(shape.type || "").toLowerCase().indexOf("text") >= 0 || String(op.kind || "").toLowerCase() === "text" || String(op.kind || "").toLowerCase() === "icon") ? textGrowTypeFromOp(op) : "";
     if (growTypeForShape) setPluginDataSafe(shape, "dvcp_grow_type", growTypeForShape);
     if (op.text) setPluginDataSafe(shape, "dvcp_text", String(op.text).slice(0, 300));
-    setPluginDataSafe(shape, "visual_materialization", "v06_13_text_no_wrap_fidelity");
+    setPluginDataSafe(shape, "visual_materialization", "v06_13_6_icon_only_no_label_fidelity");
     if (result.visual_materialization) setPluginDataSafe(shape, "visual_materialization_detail", result.visual_materialization);
     result.created_shape_ids.push(getShapeId(shape));
     result.penpot_readback.push(compactShapeReadback(shape));

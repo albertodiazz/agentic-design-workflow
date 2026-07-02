@@ -173,15 +173,40 @@ def _bbox_center_distance(a: dict[str, float] | None, b: dict[str, float] | None
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
+def _is_media_visual_source(source: dict[str, Any]) -> bool:
+    kind = str(source.get("kind") or "").lower()
+    role = str(source.get("role") or "").lower()
+    tag = str(source.get("tag") or "").lower()
+    return kind in {"media", "image", "video", "avatar"} or role in {"media", "image", "avatar"} or tag in {"img", "picture", "video", "canvas"}
+
+
+def _is_strict_ignored_img_source(source: dict[str, Any]) -> bool:
+    """Images are intentionally out of scope for this import path.
+
+    The user wants no raster/asset handling and no fallback surfaces for <img>.
+    Keep the rule structural and generic: any actual HTML img source maps to
+    the empty target set and is counted as explicitly ignored, never as a
+    Penpot layer.
+    """
+    return str(source.get("tag") or "").lower() == "img"
+
+
 def _expected_from_child(child: dict[str, Any]) -> dict[str, Any]:
     expected: dict[str, Any] = {}
     bbox = _bbox(child.get("bbox")) or child.get("bbox") or {}
     expected["bbox"] = bbox
+    # <img alt>, aria-label and title are source metadata, not visible text.
+    # Keep them traceable as media_alt but do not require a Penpot text layer.
     if child.get("text") is not None:
-        expected["text"] = str(child.get("text") or "")[:500]
+        if _is_media_visual_source(child):
+            expected["media_alt"] = str(child.get("media_alt") or child.get("text") or "")[:500]
+        else:
+            expected["text"] = str(child.get("text") or "")[:500]
+    if child.get("media_alt") is not None:
+        expected["media_alt"] = str(child.get("media_alt") or "")[:500]
     for key in SOURCE_EXPECTED_KEYS:
         value = child.get(key)
-        if value is not None and value != "":
+        if value is not None and value != "" and not (_is_media_visual_source(child) and key == "text"):
             expected[key] = value
     return expected
 
@@ -471,7 +496,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         item["source_fidelity"] = {
             "schema": "dvcp.source_fidelity.v1",
             "mode": "computed_source_authority",
-            "version": "v06.13",
+            "version": "v06.13.6",
             "applied": bool(changed),
             "fidelity_kind": fidelity_kind,
             "copied_fields": changed,
@@ -480,7 +505,7 @@ def _apply_source_fidelity(children: list[dict[str, Any]]) -> tuple[list[dict[st
         out.append(item)
     return out, {
         "schema": "dvcp.source_fidelity_summary.v1",
-        "version": "v06.13",
+        "version": "v06.13.6",
         "strategy": "computed_source_style_authority_icon_source_precedence_text_no_wrap",
         "target_count": len(children),
         "planned_source_count": planned_count,
@@ -521,7 +546,7 @@ def _attach_source_traces(children: list[dict[str, Any]], sources: list[dict[str
         "target_count": len(out),
         "matched_count": matched,
         "unmatched_count": unmatched,
-        "strategy": "bbox_text_kind_role_nearest_source_match_v06_13_text_no_wrap_fidelity",
+        "strategy": "bbox_text_kind_role_nearest_source_match_v06_13_1_exact_values",
     }
 
 
@@ -557,6 +582,10 @@ def _clean_child(child: dict[str, Any], width: float, height: float, index: int)
     if kind == "heading":
         kind = "text"
         role = role if role != "heading" else "heading"
+    # v06.13.6: strict image rule. Do not pass any actual <img> into
+    # deterministic layer creation; no fallback black surfaces/placeholders.
+    if str(child.get("tag") or "").lower() == "img":
+        return None
     if bbox["width"] > width * 1.2 or bbox["height"] > height * 1.2:
         return None
 
@@ -588,8 +617,21 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
     height = _num(spec.get("height"), 860)
     raw_children = [c for c in (spec.get("children") or []) if isinstance(c, dict)]
     cleaned: list[dict[str, Any]] = []
+    ignored_img_sources: list[dict[str, Any]] = []
     seen: set[tuple[str, int, int, int, int, str]] = set()
     for i, child in enumerate(raw_children):
+        if str(child.get("tag") or "").lower() == "img":
+            ignored_img_sources.append({
+                "source_ref": child.get("source_ref") or f"rendered_{i:03d}",
+                "source_name": child.get("name"),
+                "source_index": i,
+                "tag": child.get("tag"),
+                "kind": child.get("kind"),
+                "role": child.get("role"),
+                "reason": "strict_img_ignored_not_imported_to_penpot",
+                "bbox": child.get("bbox"),
+            })
+            continue
         clean = _clean_child(child, width, height, i)
         if not clean:
             continue
@@ -609,6 +651,8 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
     meta = dict(out.get("metadata") or {})
     meta["sanitized_for_import"] = True
     meta["sanitized_removed_count"] = len(raw_children) - len(cleaned)
+    meta["ignored_img_count"] = len(ignored_img_sources)
+    meta["ignored_img_preview"] = ignored_img_sources[:20]
     meta.setdefault("source_trace", {
         "schema": "dvcp.source_trace_summary.v1",
         "source_count": len(cleaned),
@@ -618,7 +662,13 @@ def sanitize_external_design_spec_for_import(spec: dict[str, Any]) -> tuple[dict
         "strategy": "direct_rendered_source_trace",
     })
     out["metadata"] = meta
-    return out, {"input_count": len(raw_children), "output_count": len(cleaned), "removed_count": len(raw_children) - len(cleaned)}
+    return out, {
+        "input_count": len(raw_children),
+        "output_count": len(cleaned),
+        "removed_count": len(raw_children) - len(cleaned),
+        "ignored_img_count": len(ignored_img_sources),
+        "ignored_img_preview": ignored_img_sources[:20],
+    }
 
 
 
@@ -701,7 +751,7 @@ def _target_from_source(
         "slot": slot,
         "deterministic_transform": {
             "schema": "dvcp.deterministic_transform.v1",
-            "version": "v06.13",
+            "version": "v06.13.6",
             "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
             "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
             "source_domain": "StitchRenderedElement",
@@ -730,13 +780,27 @@ def _target_from_source(
     return target
 
 
-def _text_parts_without_icon_tokens(text: Any) -> tuple[str, list[str]]:
+def _looks_like_icon_ligature_token(value: Any) -> bool:
+    token = str(value or "").strip().lower()
+    if not token:
+        return False
+    # General Material Symbols ligatures are usually snake_case tokens; keep a
+    # small allow-list only as a fallback for one-word icon ligatures.
+    if token in ICON_TOKENS:
+        return True
+    if "_" in token and re.fullmatch(r"[a-z0-9_]+", token):
+        return True
+    return False
+
+
+def _text_parts_without_icon_tokens(text: Any, icon_tokens: list[str] | tuple[str, ...] | set[str] | None = None) -> tuple[str, list[str]]:
     words = str(text or "").strip().split()
+    known_icons = {str(tok or "").strip().lower() for tok in (icon_tokens or []) if str(tok or "").strip()}
     icons: list[str] = []
     human: list[str] = []
     for word in words:
         token = word.strip().lower()
-        if token in ICON_TOKENS:
+        if token in known_icons or _looks_like_icon_ligature_token(token):
             icons.append(token)
         else:
             human.append(word)
@@ -874,13 +938,159 @@ def _source_has_material_icon_inside(source: dict[str, Any], material_icon_sourc
     return False
 
 
-def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material_icon_sources: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def _source_bbox_contains(candidate: dict[str, Any], child: dict[str, Any], *, pad: float = 3.0) -> bool:
+    cb = _bbox(candidate.get("bbox"))
+    b = _bbox(child.get("bbox"))
+    if not cb or not b:
+        return False
+    return (
+        b["x"] >= cb["x"] - pad
+        and b["y"] >= cb["y"] - pad
+        and b["x"] + b["width"] <= cb["x"] + cb["width"] + pad
+        and b["y"] + b["height"] <= cb["y"] + cb["height"] + pad
+    )
+
+
+def _child_sources_inside(source: dict[str, Any], sources: list[dict[str, Any]], *, pad: float = 4.0) -> list[dict[str, Any]]:
+    src_ref = str(source.get("source_ref") or "")
+    out: list[dict[str, Any]] = []
+    for child in sources:
+        if str(child.get("source_ref") or "") == src_ref:
+            continue
+        if _bbox_contains_center(source.get("bbox"), child.get("bbox"), pad=pad):
+            out.append(child)
+    return out
+
+
+def _is_visible_text_leaf_source(source: dict[str, Any]) -> bool:
+    text = str(source.get("text") or "").strip()
+    if not text:
+        return False
+    if _is_media_visual_source(source):
+        return False
+    if _is_material_symbol_glyph_source(source):
+        return False
+    tag = str(source.get("tag") or "").lower()
+    kind = str(source.get("kind") or "").lower()
+    role = str(source.get("role") or "").lower()
+    css = str(source.get("css_class") or "").lower()
+    family = source.get("font_family") or source.get("source_font_family")
+    # Generic rule: a leaf/span with normal text font is visual text even if a
+    # heuristic upstream labelled it as an icon because it sits in a nav/action.
+    textish = (
+        kind in {"text", "heading"}
+        or role in {"label", "heading", "body_text", "link", "content", "button_text"}
+        or tag in {"span", "p", "label", "a", "small", "strong", "em", "b"}
+    )
+    if not textish:
+        return False
+    if _font_family_is_material_symbol(family) or "material-symbol" in css:
+        return False
+    return True
+
+
+def _child_text_leaf_sources_inside_action(source: dict[str, Any], sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = [child for child in _child_sources_inside(source, sources, pad=4) if _is_visible_text_leaf_source(child)]
+    # Keep the most specific leaves. If a candidate contains another text leaf,
+    # it is a layout wrapper and should not duplicate the child text.
+    leaves: list[dict[str, Any]] = []
+    for cand in candidates:
+        if any(
+            str(other.get("source_ref") or "") != str(cand.get("source_ref") or "")
+            and _is_visible_text_leaf_source(other)
+            and _source_bbox_contains(cand, other, pad=2)
+            for other in candidates
+        ):
+            continue
+        leaves.append(cand)
+    leaves.sort(key=lambda item: (_num((_bbox(item.get("bbox")) or {}).get("y"), 0), _num((_bbox(item.get("bbox")) or {}).get("x"), 0)))
+    return leaves
+
+
+def _child_material_icon_tokens_inside(source: dict[str, Any], material_icon_sources: list[dict[str, Any]] | None) -> list[str]:
+    tokens: list[str] = []
+    for icon in material_icon_sources or []:
+        if _bbox_contains_center(source.get("bbox"), icon.get("bbox"), pad=4):
+            token = str(icon.get("text") or icon.get("material_symbol_name") or "").strip().lower()
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _child_sources_representing_layout_wrapper(source: dict[str, Any], sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return child rendered sources that visually represent a layout-only source.
+
+    This keeps the mathematical relation explicit without creating duplicate
+    Penpot layers. A wrapper may map to the empty layer set only when it is
+    represented by a stricter child source, e.g. a button/span Material Symbol
+    glyph inside an icon wrapper.
+    """
+    src_ref = str(source.get("source_ref") or "")
+    b = _bbox(source.get("bbox"))
+    if not b:
+        return []
+    text_norm = str(source.get("text") or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    for child in sources:
+        if str(child.get("source_ref") or "") == src_ref:
+            continue
+        cb = _bbox(child.get("bbox"))
+        if not cb or not _bbox_contains_center(b, child.get("bbox"), pad=4):
+            continue
+        child_text = str(child.get("text") or "").strip().lower()
+        if text_norm and child_text and child_text != text_norm:
+            continue
+        if _is_material_symbol_glyph_source(child):
+            out.append(child)
+    return out
+
+
+def _source_coverage_item(source: dict[str, Any], index: int, targets: list[dict[str, Any]], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    represented_by = _child_sources_representing_layout_wrapper(source, sources) if not targets else []
+    ignored = _is_strict_ignored_img_source(source)
+    if targets:
+        status = "materialized"
+        reason = "has_penpot_layer_targets"
+    elif ignored:
+        status = "ignored"
+        reason = "strict_img_ignored_not_imported_to_penpot"
+    elif represented_by:
+        status = "represented_by_child"
+        reason = "layout_wrapper_represented_by_material_symbol_child"
+    else:
+        status = "unrepresented"
+        reason = "no_deterministic_target_rule"
+    return {
+        "source_ref": source.get("source_ref"),
+        "source_name": source.get("name"),
+        "source_index": index,
+        "tag": source.get("tag"),
+        "kind": source.get("kind"),
+        "role": source.get("role"),
+        "text": source.get("text"),
+        "status": status,
+        "reason": reason,
+        "target_count": len(targets),
+        "target_names": [target.get("name") for target in targets],
+        "represented_by_child_refs": [child.get("source_ref") for child in represented_by],
+        "represented_by_child_names": [child.get("name") for child in represented_by],
+    }
+
+
+def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material_icon_sources: list[dict[str, Any]] | None = None, sources: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     kind = str(source.get("kind") or "").lower()
     role = str(source.get("role") or "").lower()
     tag = str(source.get("tag") or "").lower()
     text = str(source.get("text") or "").strip()
     rendered_icons_enabled = _rendered_import_icons_enabled()
     out: list[dict[str, Any]] = []
+    sources = sources or []
+
+    # v06.13.6: actual <img> nodes are ignored strictly. This function returns
+    # no targets and coverage classifies the source as ignored if such a source
+    # slips past sanitization.
+    if _is_strict_ignored_img_source(source):
+        return out
 
     # v06.13: Material Symbols are text ligatures, but semantically they are
     # icon glyphs. Handle them before generic span/text mapping so Penpot gets
@@ -904,12 +1114,13 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material
         out.append(icon_target)
         return out
 
-    # Icon wrappers are not glyphs. If they have visible paint they become
-    # surfaces, otherwise they are layout-only and intentionally produce no
-    # Penpot layer. This avoids duplicated/overlaid symbols when
-    # STITCH_RENDERED_IMPORT_ICONS=1 exposes the real glyph span separately.
+    # Icon wrappers are not glyphs. A normal-font leaf inside an action/nav is
+    # still editorial text even if upstream classified it as role=icon. Painted
+    # wrappers become surfaces; paintless wrappers are represented by children.
     if kind == "icon" or role == "icon":
-        if _source_has_visible_paint(source):
+        if _is_visible_text_leaf_source(source):
+            out.append(_target_from_source(source, index, name_suffix="Text", slot="source_element", kind="text", role="content", text=text, rule_id="text.leaf_from_icon_role"))
+        elif _source_has_visible_paint(source):
             surf = _target_from_source(
                 source, index, name_suffix="Surface", slot="source_element",
                 kind="surface", role="media", rule_id="icon.container_surface",
@@ -971,11 +1182,24 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material
         b = _bbox(source.get("bbox"))
         fill = str(source.get("fill") or "").strip().lower()
         has_container = bool(fill and fill not in {"transparent", "none", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)"}) or (b and b["height"] > 28)
-        human_text, icon_tokens = _text_parts_without_icon_tokens(text)
+        rendered_icon_tokens = _child_material_icon_tokens_inside(source, material_icon_sources)
+        leaf_text_sources = _child_text_leaf_sources_inside_action(source, sources)
+        human_text, icon_tokens = _text_parts_without_icon_tokens(text, rendered_icon_tokens)
+        if rendered_icon_tokens:
+            icon_tokens = sorted(set(icon_tokens) | set(rendered_icon_tokens))
+        # When the browser exposes real text leaves inside the action, those
+        # sources will materialize directly. Do not synthesize a duplicate label
+        # from the parent textContent.
+        label_owned_by_text_leaf = bool(leaf_text_sources)
         has_rendered_icon = any(
             _source_has_material_icon_inside(source, material_icon_sources, token=tok)
             for tok in icon_tokens
         )
+        # v06.13.6: icon-only actions/buttons must never synthesize a normal
+        # text label from the parent textContent. Example: <button><span
+        # class="material-symbols-outlined">menu</span></button> maps to
+        # button container + Material Symbols glyph only.
+        icon_only_action = bool(rendered_icon_tokens or has_rendered_icon) and not human_text and not label_owned_by_text_leaf
         if not has_container:
             out.append(_target_from_source(source, index, name_suffix="ActionText", slot="source_element", kind="text", role="action", text=text, rule_id="action.text_only"))
             return out
@@ -985,9 +1209,16 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material
         action.pop("text", None)
         action["component_type"] = "action"
         action["component_id"] = _safe_name(action.get("name"), f"Action{index}")
+        if label_owned_by_text_leaf:
+            action["skipped_parent_label_reason"] = "skipped_parent_label_because_child_text_exists"
+            action["child_text_leaf_refs"] = [child.get("source_ref") for child in leaf_text_sources]
+            action["child_text_leaf_names"] = [child.get("name") for child in leaf_text_sources]
+        elif icon_only_action:
+            action["skipped_parent_label_reason"] = "skipped_parent_label_because_icon_only_button"
+            action["child_icon_tokens"] = list(rendered_icon_tokens or icon_tokens)
         out.append(action)
         label = human_text or text
-        if label:
+        if label and not label_owned_by_text_leaf and not icon_only_action:
             text_target = _target_from_source(
                 source,
                 index,
@@ -1030,6 +1261,17 @@ def _transform_one_source_to_penpot(source: dict[str, Any], index: int, material
     role_out = role or ("navigation" if tag in {"header", "nav"} else "surface")
     kind_out = "surface" if kind in {"surface", "container", "card", "section", "navigation", "form", "media"} else (kind or "surface")
     target = _target_from_source(source, index, name_suffix="Surface", slot="source_element", kind=kind_out, role=role_out, rule_id="surface.identity")
+    if _is_media_visual_source(source):
+        alt = str(source.get("media_alt") or source.get("text") or "").strip()
+        target.pop("text", None)
+        if alt:
+            target["media_alt"] = alt[:500]
+            snap = target.get("source_snapshot") if isinstance(target.get("source_snapshot"), dict) else {}
+            expected = snap.get("expected") if isinstance(snap.get("expected"), dict) else {}
+            expected.pop("text", None)
+            expected["media_alt"] = alt[:500]
+            snap["expected"] = expected
+            target["source_snapshot"] = snap
     if tag in {"header", "footer"}:
         target["role"] = tag
     out.append(target)
@@ -1073,8 +1315,10 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     transformed: list[dict[str, Any]] = []
     rule_counts: dict[str, int] = {}
     relation_pairs: list[dict[str, Any]] = []
+    source_coverage_items: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
-        targets = _transform_one_source_to_penpot(source, index, material_icon_sources)
+        targets = _transform_one_source_to_penpot(source, index, material_icon_sources, sources)
+        source_coverage_items.append(_source_coverage_item(source, index, targets, sources))
         for target in targets:
             dt = target.get("deterministic_transform") if isinstance(target.get("deterministic_transform"), dict) else {}
             rule_id = str(dt.get("rule_id") or "unknown")
@@ -1089,17 +1333,55 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     transformed = _dedupe_transformed_targets(transformed)
     transformed, source_fidelity_summary = _apply_source_fidelity(transformed)
 
+    source_coverage = {
+        "schema": "dvcp.source_relation_coverage.v1",
+        "source_total": len(sources),
+        "source_materialized_count": sum(1 for item in source_coverage_items if item.get("status") == "materialized"),
+        "source_represented_by_child_count": sum(1 for item in source_coverage_items if item.get("status") == "represented_by_child"),
+        "source_ignored_count": sum(1 for item in source_coverage_items if item.get("status") == "ignored"),
+        "source_unrepresented_count": sum(1 for item in source_coverage_items if item.get("status") == "unrepresented"),
+        "strict_no_unexplained_sources": not any(item.get("status") == "unrepresented" for item in source_coverage_items),
+        "represented_by_child_preview": [item for item in source_coverage_items if item.get("status") == "represented_by_child"][:20],
+        "ignored_preview": [item for item in source_coverage_items if item.get("status") == "ignored"][:20],
+        "unrepresented_preview": [item for item in source_coverage_items if item.get("status") == "unrepresented"][:20],
+    }
+
+    skipped_parent_label_targets = [target for target in transformed if target.get("skipped_parent_label_reason") == "skipped_parent_label_because_child_text_exists"]
+    skipped_icon_only_label_targets = [target for target in transformed if target.get("skipped_parent_label_reason") == "skipped_parent_label_because_icon_only_button"]
+
     transform_summary = {
         "schema": "dvcp.deterministic_transform_summary.v1",
-        "version": "v06.13",
+        "version": "v06.13.6",
         "relation": "R ⊆ StitchRenderedElement × PenpotLayer",
         "function": "T : StitchRenderedElement -> Pow(PenpotLayer)",
         "source_domain": "StitchRenderedElement",
         "target_domain": "PenpotLayer",
         "source_count": len(sources),
         "target_count": len(transformed),
+        "source_coverage": source_coverage,
         "rule_counts": rule_counts,
         "material_symbol_source_count": len(material_icon_sources),
+        "skipped_parent_label_count": len(skipped_parent_label_targets),
+        "skipped_parent_label_preview": [
+            {
+                "source_ref": target.get("source_ref"),
+                "target_name": target.get("name"),
+                "reason": target.get("skipped_parent_label_reason"),
+                "child_text_leaf_refs": target.get("child_text_leaf_refs"),
+                "child_text_leaf_names": target.get("child_text_leaf_names"),
+            }
+            for target in skipped_parent_label_targets[:20]
+        ],
+        "skipped_icon_only_label_count": len(skipped_icon_only_label_targets),
+        "skipped_icon_only_label_preview": [
+            {
+                "source_ref": target.get("source_ref"),
+                "target_name": target.get("name"),
+                "reason": target.get("skipped_parent_label_reason"),
+                "child_icon_tokens": target.get("child_icon_tokens"),
+            }
+            for target in skipped_icon_only_label_targets[:20]
+        ],
         "icon_inference": {
             "enabled": not rendered_icons_enabled,
             "mode": "fallback_when_STITCH_RENDERED_IMPORT_ICONS_is_0" if not rendered_icons_enabled else "disabled_by_STITCH_RENDERED_IMPORT_ICONS",
@@ -1112,9 +1394,10 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
         "schema": "dvcp.source_trace_summary.v1",
         "source_count": len(sources),
         "target_count": len(transformed),
-        "matched_count": len(transformed),
-        "unmatched_count": 0,
-        "strategy": "deterministic_transform_T_v06_13_source_to_penpot",
+        "matched_count": source_coverage["source_materialized_count"] + source_coverage["source_represented_by_child_count"] + source_coverage.get("source_ignored_count", 0),
+        "unmatched_count": source_coverage["source_unrepresented_count"],
+        "source_coverage": source_coverage,
+        "strategy": "deterministic_transform_T_v06_13_6_icon_only_no_label_fidelity_source_to_penpot",
         "deterministic_transform": transform_summary,
         "source_fidelity": source_fidelity_summary,
     }
@@ -1137,7 +1420,7 @@ def build_external_design_spec_from_deterministic_transform(fallback_spec: dict[
     spec["metadata"] = meta
     summary = {
         "used": False,
-        "reason": "deterministic_transform_T_v06_13",
+        "reason": "deterministic_transform_T_v06_13_6_icon_only_no_label_fidelity",
         "planner": "disabled_for_structure",
         "deterministic": True,
         "fallback_child_count": len(sources),

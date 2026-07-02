@@ -461,7 +461,7 @@ def _visual_context_for(item: dict[str, Any], items: list[dict[str, Any]], token
 SOURCE_EXPECTED_KEYS = (
     "fill", "stroke", "stroke_width", "color", "text_color", "font_size", "font_weight",
     "font_family", "source_font_family", "line_height", "source_line_height_px", "penpot_line_height_ratio", "text_align", "radius", "opacity", "fill_opacity",
-    "box_shadow", "input_type", "is_material_symbol", "material_symbol_name",
+    "box_shadow", "input_type", "media_alt", "is_material_symbol", "material_symbol_name",
     "text_no_wrap", "expected_line_count", "source_line_count", "penpot_grow_type",
 )
 
@@ -882,7 +882,7 @@ def _project_expected_for_slot(
 
     return {
         "schema": "dvcp.source_slot_projection.v1",
-        "version": "v06.13",
+        "version": "v06.13.6",
         "source_ref": source_snapshot.get("source_ref"),
         "slot_kind": slot_kind,
         "slot": trace.get("slot"),
@@ -1058,10 +1058,11 @@ def _style_drift_diagnostics(
                     "autofixable": True,
                 })
 
-    # v06.13: readback font fidelity diagnostics. Family fallback is a warning,
-    # but weight mismatch is a real visual issue because Stitch explicitly
-    # specifies weights such as Inter 700 for headings.
-    if shape_ids and ({"font_family", "font_weight"} & set(fields)):
+    # v06.13.1: readback text fidelity diagnostics. The deterministic
+    # contract is source computed style -> Penpot op -> Penpot readback.
+    # Geometry is checked above; here we verify text, font size, weight, family
+    # and line-height as first-class values instead of treating them as visual hints.
+    if shape_ids and ({"font_family", "font_weight", "font_size", "line_height", "text"} & set(fields)):
         rb_style = _first_readback_text_style(readback_normalized)
         actual_font = rb_style.get("fontFamily") if isinstance(rb_style, dict) else None
         expected_font = expected.get("font_family") or op_values.get("font_family") or op_values.get("source_font_family")
@@ -1104,6 +1105,51 @@ def _style_drift_diagnostics(
                 "autofixable": True,
             })
 
+        expected_text = op_values.get("text") or expected.get("text")
+        actual_text = rb_style.get("characters") if isinstance(rb_style, dict) else None
+        if actual_text is None and isinstance(rb_style, dict):
+            actual_text = rb_style.get("text")
+        if expected_text is not None and actual_text is not None and str(expected_text) != str(actual_text):
+            issues.append({
+                "category": "text_content_mismatch",
+                "field": "text",
+                "severity": "high",
+                "expected": expected_text,
+                "actual": actual_text,
+                "message": "Penpot text content differs from Stitch rendered text.",
+                "autofixable": True,
+            })
+
+        expected_size = op_values.get("font_size") or expected.get("font_size")
+        actual_size = rb_style.get("fontSize") if isinstance(rb_style, dict) else None
+        if expected_size is not None and actual_size is not None and abs(_num(expected_size, 0) - _num(actual_size, 0)) > 0.2:
+            issues.append({
+                "category": "font_size_mismatch",
+                "field": "font_size",
+                "severity": "medium",
+                "expected": expected_size,
+                "actual": actual_size,
+                "message": "Penpot font size differs from Stitch computed style.",
+                "autofixable": True,
+            })
+
+        expected_line_ratio = op_values.get("penpot_line_height_ratio") or expected.get("penpot_line_height_ratio")
+        if expected_line_ratio is None:
+            raw_lh = op_values.get("line_height") or expected.get("line_height")
+            if raw_lh is not None and _num(raw_lh, 0) <= 4:
+                expected_line_ratio = raw_lh
+        actual_line_ratio = rb_style.get("lineHeight") if isinstance(rb_style, dict) else None
+        if expected_line_ratio is not None and actual_line_ratio is not None and abs(_num(expected_line_ratio, 0) - _num(actual_line_ratio, 0)) > 0.015:
+            issues.append({
+                "category": "line_height_mismatch",
+                "field": "line_height",
+                "severity": "medium",
+                "expected": expected_line_ratio,
+                "actual": actual_line_ratio,
+                "message": "Penpot line-height differs from the Stitch computed line-height ratio.",
+                "autofixable": True,
+            })
+
         expected_lines = _num(op_values.get("expected_line_count") or op_values.get("source_line_count"), 0)
         expected_grow = str(op_values.get("penpot_grow_type") or "").lower()
         actual_grow = str(rb_style.get("growType") if isinstance(rb_style, dict) else "").lower()
@@ -1119,15 +1165,9 @@ def _style_drift_diagnostics(
                     "autofixable": True,
                 })
             else:
-                warnings.append({
-                    "category": "single_line_text_no_wrap",
-                    "field": "growType",
-                    "severity": "info",
-                    "expected": expected_grow or "single_line",
-                    "actual": rb_style.get("growType") if isinstance(rb_style, dict) else None,
-                    "message": "Source text height indicates one visual line; importer requested no-wrap fidelity.",
-                    "autofixable": False,
-                })
+                # Verified no-wrap is not a drift warning. Keep exact quality
+                # when source and Penpot values already match.
+                pass
 
     high = sum(1 for issue in issues if issue.get("severity") == "high")
     medium = sum(1 for issue in issues if issue.get("severity") == "medium")
@@ -1237,9 +1277,9 @@ def _source_to_penpot_map_from_results(results: list[dict[str, Any]]) -> tuple[l
     real_issue_count = sum(issue_counts.values())
     warning_count = sum(warning_counts.values())
     report = {
-        "schema": "dvcp.source_penpot_deterministic_report.v6",
+        "schema": "dvcp.source_penpot_deterministic_report.v7",
         "mode": "source_map_no_llm",
-        "cleanup": "v06.13_text_no_wrap_fidelity",
+        "cleanup": "v06.13.6_icon_only_no_label_fidelity",
         "mapping_count": len(mappings),
         "mapped_shape_count": mapped,
         "issue_count": real_issue_count,
@@ -1310,9 +1350,10 @@ def _normalise_text_fidelity_fields(op: dict[str, Any]) -> None:
     is_single_line = source_line_count <= 1.15
     if is_single_line:
         op["text_no_wrap"] = True
-    align = str(op.get("text_align") or "left").lower()
     is_material = _is_material_symbol_op_values(op) or kind == "icon"
-    if is_single_line and not is_material and align in {"start", "left"}:
+    # v06.13.6: if Stitch/Chromium rendered it as one visual line, Penpot must
+    # not wrap it. This applies to centered headings too. Icons remain fixed.
+    if is_single_line and not is_material:
         op["penpot_grow_type"] = "auto-width"
     else:
         op.setdefault("penpot_grow_type", "fixed")
@@ -1390,6 +1431,7 @@ def _item_to_op(
         "opacity",
         "box_shadow",
         "input_type",
+        "media_alt",
         "is_material_symbol",
         "material_symbol_name",
         "svg",
@@ -1452,7 +1494,13 @@ def build_stitch_import_queue(spec: dict[str, Any]) -> dict[str, Any]:
     """Convert ExternalDesignSpec to a resumable Penpot import job."""
     screen_name = _safe_name(spec.get("screen_name"), "ImportedStitchScreen")
     offset = _root_offset(spec)
-    raw_children = [child for child in (spec.get("children") or []) if isinstance(child, dict)]
+    # v06.13.6 strict image rule: actual HTML <img> nodes must never be
+    # materialized in Penpot in this import path. The deterministic planner
+    # already removes them; this queue filter is a defensive guard.
+    raw_children = [
+        child for child in (spec.get("children") or [])
+        if isinstance(child, dict) and str(child.get("tag") or "").lower() != "img"
+    ]
     assembled_children, assembly_summary = semantic_component_assembly(raw_children)
     children = _sorted_children_for_queue(assembled_children)
     # +2 because op 0 is root and the last op restacks/finalizes the job.

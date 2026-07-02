@@ -2310,7 +2310,7 @@ async def import_from_stitch(
                 "public_action": "import_from_stitch",
                 "planning": "deterministic_transform_with_optional_llm_fallback",
                 "layout": "playwright_rendered",
-                "execution": "queue_execute_code_v06_13_text_no_wrap_fidelity",
+                "execution": "queue_execute_code_v06_13_6_icon_only_no_label_fidelity",
             },
             "hint": "Revisa STITCH_API_KEY, STITCH_PROJECT_ID/STITCH_SCREEN_ID y Playwright.",
         }
@@ -2366,7 +2366,7 @@ async def import_from_stitch(
     # each Penpot shape is mapped back to a rendered source element and its
     # expected computed values.
     visual_diff_report: dict[str, Any] | None = make_visual_diff_status(
-        "skipped", reason="replaced_by_source_to_penpot_trace_v06_13_text_no_wrap_fidelity"
+        "skipped", reason="replaced_by_source_to_penpot_trace_v06_13_6_icon_only_no_label_fidelity"
     )
     source_trace_report = queue_result.get("source_trace_report")
     source_to_penpot_map = queue_result.get("source_to_penpot_map")
@@ -2395,7 +2395,7 @@ async def import_from_stitch(
             "planning": ("deterministic_transform" if llm_plan_summary.get("deterministic") else ("llm_vision_guided" if llm_plan_summary.get("vision_used") else ("llm_guided" if llm_plan_summary.get("used") else "rendered_fallback"))),
             "layout": ((base_spec or {}).get("metadata") or {}).get("layout_extraction_mode", "rendered_playwright") if isinstance(base_spec, dict) else "unknown",
             "assembly": "generic_semantic_component_assembly",
-            "execution": "queue_execute_code_v06_13_text_no_wrap_fidelity",
+            "execution": "queue_execute_code_v06_13_6_icon_only_no_label_fidelity",
                         "validation": "normal_validator_optional_env_STITCH_IMPORT_RUN_VALIDATOR",
         },
         "stitch": stitch_info,
